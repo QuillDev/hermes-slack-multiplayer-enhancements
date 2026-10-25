@@ -6,6 +6,7 @@ Run from the hermes-agent checkout so the real Slack adapter imports:
 """
 
 import asyncio
+import time
 import importlib.util
 import sys
 from pathlib import Path
@@ -227,3 +228,42 @@ def test_identity_prompt_explains_the_mention_format():
     prompt = adapter._build_identity_prompt()
     assert '"@helper bot"' in prompt
     assert "(you)" in prompt and "(USERID)" in prompt
+
+
+# ---------------------------------------------------------------------------
+# Untagged replies in a thread we posted in (raw chat.postMessage under someone else's root)
+# ---------------------------------------------------------------------------
+
+ALERTS = "U0000000ALR"  # an alert integration that posts thread roots
+USERS[ALERTS] = {"is_bot": True, "name": "alerts", "real_name": "alerts",
+                 "profile": {"display_name": "alerts", "real_name": "alerts"}}
+
+
+def _mention_gated_adapter(thread_authors, root):
+    adapter = _adapter(FakeSlackUsers(USERS))
+    adapter.config.extra["require_mention"] = True
+    adapter._thread_context_cache = {
+        f"C0000000CHN:{root}:": _slack_mod._ThreadContextCache(
+            content="ctx", fetched_at=time.monotonic(), message_count=len(thread_authors),
+            parent_text="alert fired", parent_user_id=thread_authors[0],
+            messages=[{"user": u, "ts": f"1700000300.00000{i}"} for i, u in enumerate(thread_authors)]),
+    }
+    return adapter
+
+
+def test_untagged_reply_reaches_us_in_a_thread_we_posted_in():
+    root = "1700000300.000000"
+    adapter = _mention_gated_adapter([ALERTS, SELF], root)
+    count = _deliver_raw(adapter, text="mark it as resolved", ts="1700000300.000900",
+                         thread_ts=root, parent_user_id=ALERTS)
+    assert count == 1
+    assert adapter.handle_message.await_args.args[0].text == "mark it as resolved"
+
+
+def test_untagged_reply_in_a_thread_we_never_posted_in_stays_ignored():
+    root = "1700000300.000000"
+    for authors in ([ALERTS, HUMAN], [HUMAN, RELAY]):
+        adapter = _mention_gated_adapter(authors, root)
+        count = _deliver_raw(adapter, text="mark it as resolved", ts="1700000300.000900",
+                             thread_ts=root, parent_user_id=authors[0])
+        assert count == 0, authors
