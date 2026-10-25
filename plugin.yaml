@@ -1,4 +1,4 @@
 name: slack-multiplayer-enhancements
 version: 0.1.0
-description: Unaddressed Slack channel messages may get no reply instead of the silence-marker warning; inbound @mentions keep their target as "@name (UID)" and "@name (you)"; channel messages addressed to someone else are ignored.
+description: Bare silence markers never post the warning; inbound @mentions keep their target as "@name (UID)" and "@name (you)"; channel messages addressed to someone else are ignored; untagged replies in threads the bot posted in wake it; mid-turn messages in shared chats name their sender.
 author: QuillDev
