@@ -118,9 +118,9 @@ class _Receiver:
         return True
 
 
-async def _steer(runner, route):
-    event = MessageEvent(text=f"/steer {TEXT}" if route == "explicit" else TEXT, source=SPEAKER,
-                         message_id="1700000400.000100")
+async def _steer(runner, route, text=TEXT, internal=False):
+    event = MessageEvent(text=f"/steer {text}" if route == "explicit" else text, source=SPEAKER,
+                         message_id="1700000400.000100", internal=internal)
     receiver = _Receiver()
     runner._session_state("key").turn.agent = receiver
     if route == "explicit":
@@ -157,3 +157,115 @@ async def test_steer_in_a_per_user_session_is_unchanged(route):
 
     assert "Alex Example" not in row and "Shared chat:" not in row
     assert f"\n\n{TEXT}\n[/OUT-OF-BAND USER MESSAGE]" in row
+
+
+# ---------------------------------------------------------------------------
+# Gateway-made notices in a shared chat carry no sender prefix
+# ---------------------------------------------------------------------------
+
+NOTICE = ("[IMPORTANT: Background process proc_000000000000 completed normally (exit code 0).\n"
+          "Command: sleep 1]")
+
+
+@pytest.mark.asyncio
+async def test_background_notice_in_a_shared_chat_is_not_attributed_to_the_last_speaker():
+    shared = gateway_run.GatewayRunner(GatewayConfig(group_sessions_per_user=False))
+    notice = MessageEvent(text=NOTICE, source=SPEAKER, internal=True)
+
+    turn_text = await shared._prepare_inbound_message_text(
+        event=notice, source=SPEAKER, history=[])
+
+    assert turn_text == NOTICE
+    # A person's message in the same chat still names them.
+    person = await shared._prepare_inbound_message_text(
+        event=MessageEvent(text=TEXT, source=SPEAKER), source=SPEAKER, history=[])
+    assert person == f"[Alex Example | Slack user <@U0000000ALX>] {TEXT}"
+
+
+@pytest.mark.asyncio
+async def test_background_notice_keeps_backfilled_channel_context():
+    shared = gateway_run.GatewayRunner(GatewayConfig(group_sessions_per_user=False))
+    notice = MessageEvent(text=NOTICE, source=SPEAKER, internal=True,
+                          channel_context="[Thread context]\nAlex Example: hi\n[End of thread context]")
+
+    turn_text = await shared._prepare_inbound_message_text(
+        event=notice, source=SPEAKER, history=[])
+
+    assert turn_text.startswith("[Thread context]")
+    assert turn_text.endswith(f"[New message]\n{NOTICE}")
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("route", ["priority", "normal"])
+async def test_background_notice_steered_mid_turn_is_not_attributed_to_a_participant(route):
+    shared = gateway_run.GatewayRunner(GatewayConfig(group_sessions_per_user=False))
+
+    row = await _steer(shared, route, text=NOTICE, internal=True)
+
+    assert "Alex Example" not in row and "Shared chat:" not in row
+    assert NOTICE.splitlines()[0] in row
+
+
+# ---------------------------------------------------------------------------
+# /goal: a judge refused by its provider pauses with the real reason
+# ---------------------------------------------------------------------------
+
+
+class _Reply:
+    def __init__(self, content, finish_reason):
+        message = MagicMock()
+        message.content = content
+        choice = MagicMock()
+        choice.message, choice.finish_reason = message, finish_reason
+        self.choices = [choice]
+
+
+def _judge_answers(monkeypatch, content, finish_reason):
+    """Fake the judge provider (not ours): every call_llm returns this reply."""
+    calls = []
+
+    def call_llm(**kwargs):
+        calls.append(kwargs)
+        return _Reply(content, finish_reason)
+    monkeypatch.setattr("agent.auxiliary_client.call_llm", call_llm)
+    return calls
+
+
+def _goal(goal_text="clean up the bot channel"):
+    from hermes_cli.goals import GoalManager
+    manager = GoalManager("sess-goal-test")
+    manager.set(goal_text)
+    return manager
+
+
+def test_goal_judge_refused_by_its_provider_pauses_on_the_first_turn_with_that_reason(monkeypatch):
+    _judge_answers(monkeypatch, None, "content_filter")
+    manager = _goal()
+
+    decision = manager.evaluate_after_turn("i won't do that.")
+
+    assert decision["status"] == "paused" and decision["should_continue"] is False
+    assert "refused to evaluate this goal" in decision["message"]
+    assert "JSON verdict" not in decision["message"]
+    assert manager.state.status == "paused"
+
+
+def test_goal_judge_empty_reply_without_a_refusal_still_counts_as_a_bad_judge(monkeypatch):
+    _judge_answers(monkeypatch, "", "stop")
+    manager = _goal()
+
+    decisions = [manager.evaluate_after_turn("still working on it.") for _ in range(3)]
+
+    assert [d["status"] for d in decisions] == ["active", "active", "paused"]
+    assert "judge returned empty response" in decisions[0]["message"]
+    assert "JSON verdict" in decisions[-1]["message"]
+
+
+def test_goal_judge_normal_verdicts_are_unchanged(monkeypatch):
+    _judge_answers(monkeypatch, '{"verdict": "done", "reason": "the channel is clean"}', "stop")
+    manager = _goal()
+
+    decision = manager.evaluate_after_turn("cleaned it up.")
+
+    assert decision["status"] == "done"
+    assert manager.state.status == "done"

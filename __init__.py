@@ -38,6 +38,21 @@
    A message that lands mid-turn is steered into the running turn instead, and the steer
    marker says it is "from the user", so it read as coming from whoever started the turn.
    Steered text now carries the same sender prefix, plus a line saying who it is from.
+   Gateway-made notices (a finished background process, a goal or heartbeat wake-up) come from
+   nobody, so neither path gives them a sender prefix; core would otherwise stamp them with the
+   name of whoever spoke last.
+
+6. Thread history uses the same mention format as live messages.
+
+   The thread context fetched on a cold start or a re-tag kept raw ``<@UID>`` ids and dropped
+   our own mention. Each line now reads ``@Name (UID)`` / ``@Name (you)`` like item 2.
+
+7. A provider refusal pauses /goal with the real reason.
+
+   When the judge's provider refuses the call (``finish_reason == "content_filter"``, as
+   Anthropic does for some goals), core read the empty reply as "judge returned empty
+   response", burned three turns, then blamed the judge model's JSON. The refusal is now a
+   ``blocked`` verdict, so the goal pauses after the first turn and says the provider refused.
 
 All of this patches private Hermes internals. When upstream renames one, the matching patch
 logs an error and that piece falls back to stock behavior. The gateway and the Slack adapter
@@ -113,6 +128,27 @@ _IDENTITY_NOTE = (
     "them, even if their name looks generic (for example another bot named \"bot\")."
     ' Other bots here may be named "Hermes"; that name never refers to you, so a message '
     'addressed to Hermes is not for you.')
+
+
+# ----- thread history mentions ---------------------------------------------------
+
+
+def _make_thread_context_line(original):
+    async def _thread_context_line(self, msg, msg_text, is_parent, team_id, channel_id):
+        # Core strips our own mention before this runs. Put it back when that is the only
+        # difference, so it can read "(you)", then humanize like a live message.
+        bot_uid = self._team_bot_user_ids.get(team_id, self._bot_user_id) or ""
+        if bot_uid and isinstance(msg, dict):
+            try:
+                full = self._render_message_text(msg)
+            except Exception:
+                full = ""
+            if full and full.replace(f"<@{bot_uid}>", "").strip() == msg_text:
+                msg_text = full
+        msg_text = await self._humanize_user_mentions(msg_text, chat_id=channel_id, team_id=team_id)
+        return await original(self, msg, msg_text, is_parent, team_id, channel_id)
+    _thread_context_line.__wrapped__ = original
+    return _thread_context_line
 
 
 # ----- messages addressed to someone else -------------------------------------
@@ -230,13 +266,77 @@ def _shared_sender_label(runner, source):
 
 def _make_steer_text_with_origin(original):
     def _steer_text_with_origin(self, text, event):
-        if text.strip() and event is not None:
+        if text.strip() and event is not None and not getattr(event, "internal", False):
             sender = _shared_sender_label(self, event.source)
             if sender:
                 text = f"{_SHARED_STEER_NOTE}[{sender}] {text}"
         return original(self, text, event)
     _steer_text_with_origin.__wrapped__ = original
     return _steer_text_with_origin
+
+
+def _make_prefix_inbound_sender_context(original):
+    def _prefix_inbound_sender_context(self, event, source, message_text):
+        if getattr(event, "internal", False) and getattr(source, "user_name", None):
+            # A gateway-made notice has no sender; drop the name so no prefix is added. The
+            # channel-context part of the original still applies.
+            from gateway.session_identity import replace_source
+            source = replace_source(source, user_name=None)
+        return original(self, event, source, message_text)
+    _prefix_inbound_sender_context.__wrapped__ = original
+    return _prefix_inbound_sender_context
+
+
+# ----- goal judge refusals ----------------------------------------------------------
+
+_JUDGE_REFUSED_REASON = (
+    "the judge model's provider refused to evaluate this goal (content filter), so it "
+    "can't be judged")
+
+
+def _make_call_goal_judge_llm(original):
+    import json
+
+    def _call_goal_judge_llm(call_llm, system_prompt, user_prompt, timeout):
+        finish = []
+
+        def _recording_call_llm(*args, **kwargs):
+            resp = call_llm(*args, **kwargs)
+            try:
+                finish.append(resp.choices[0].finish_reason)
+            except Exception:
+                pass
+            return resp
+
+        raw = original(_recording_call_llm, system_prompt, user_prompt, timeout)
+        if not (raw or "").strip() and "content_filter" in finish:
+            return json.dumps({"verdict": "blocked", "reason": _JUDGE_REFUSED_REASON})
+        return raw
+    _call_goal_judge_llm.__wrapped__ = original
+    return _call_goal_judge_llm
+
+
+def _patch_goals(module) -> None:
+    original = getattr(module, "_call_goal_judge_llm", None)
+    if original is None:
+        logger.error("slack-multiplayer-enhancements: _call_goal_judge_llm is gone; the goal judge patch is off")
+        return
+    if getattr(original, _PATCHED_FLAG, False):
+        return
+    patched = _make_call_goal_judge_llm(original)
+    setattr(patched, _PATCHED_FLAG, True)
+    module._call_goal_judge_llm = patched
+
+
+def _patch_run_inbound(module) -> None:
+    cls = getattr(module, "GatewayInboundMixin", None)
+    if cls is None:
+        logger.error("slack-multiplayer-enhancements: GatewayInboundMixin is gone; the notice prefix patch is off")
+        return
+    if getattr(cls, _PATCHED_FLAG, False):
+        return
+    _wrap_method(cls, "_prefix_inbound_sender_context", _make_prefix_inbound_sender_context)
+    setattr(cls, _PATCHED_FLAG, True)
 
 
 # ----- applying patches -------------------------------------------------------------
@@ -259,6 +359,7 @@ def _patch_adapter_class(cls) -> bool:
     _wrap_method(cls, "_build_identity_prompt", _make_build_identity_prompt)
     _wrap_method(cls, "_handle_slack_message", _make_handle_slack_message)
     _wrap_method(cls, "_should_wake_on_unmentioned_message", _make_should_wake)
+    _wrap_method(cls, "_thread_context_line", _make_thread_context_line)
     setattr(cls, _PATCHED_FLAG, True)
     return True
 
@@ -295,6 +396,8 @@ def _is_slack_adapter_file(path) -> bool:
 _GATEWAY_PATCHES = {
     "gateway.response_filters": _patch_response_filters,
     "gateway.run_busy": _patch_run_busy,
+    "gateway.run_inbound": _patch_run_inbound,
+    "hermes_cli.goals": _patch_goals,
 }
 
 

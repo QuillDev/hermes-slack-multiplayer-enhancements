@@ -267,3 +267,53 @@ def test_untagged_reply_in_a_thread_we_never_posted_in_stays_ignored():
         count = _deliver_raw(adapter, text="mark it as resolved", ts="1700000300.000900",
                              thread_ts=root, parent_user_id=authors[0])
         assert count == 0, authors
+
+
+# ---------------------------------------------------------------------------
+# Thread history uses the same mention format as live messages
+# ---------------------------------------------------------------------------
+
+
+class FakeSlackThread:
+    """conversations.replies answering from one fixed thread."""
+
+    def __init__(self, messages):
+        self.messages = messages
+
+    async def conversations_replies(self, channel, ts, limit=None, inclusive=True, **_kw):
+        return {"ok": True, "messages": [m for m in self.messages
+                                         if m.get("thread_ts", m["ts"]) == ts][:limit]}
+
+
+def test_thread_history_shows_mentions_like_live_messages():
+    root = "1700000400.000000"
+    thread = FakeSlackThread([
+        {"ts": root, "user": HUMAN, "text": f"<@{RELAY}> can you check the deploy", "client_msg_id": "a"},
+        {"ts": "1700000400.000100", "thread_ts": root, "user": RELAY, "bot_id": "B0000000RLY",
+         "text": f"<@{HUMAN}> on it, cc <@{OTHER_HERMES}|bot>"},
+        {"ts": "1700000400.000200", "thread_ts": root, "user": HUMAN, "client_msg_id": "b",
+         "text": f"<@{SELF}> do you agree with <@{RELAY}>?"},
+        {"ts": "1700000400.000300", "thread_ts": root, "user": SELF, "bot_id": "B0000000SLF",
+         "text": f"<@{HUMAN}> mostly, yes"},
+        {"ts": "1700000400.000900", "thread_ts": root, "user": HUMAN, "client_msg_id": "c",
+         "text": f"<@{SELF}> and now?"},
+    ])
+    adapter = _adapter(FakeSlackUsers(USERS))
+    adapter._app.client.conversations_replies = thread.conversations_replies
+
+    event = asyncio.run(_deliver_thread_reply(adapter, thread.messages[-1]))
+
+    history = event.channel_context
+    assert "<@" not in history
+    assert f"Alex Example: @relay ({RELAY}) can you check the deploy" in history
+    assert f"relay: @Alex Example ({HUMAN}) on it, cc @bot ({OTHER_HERMES})" in history
+    assert f"Alex Example: @helper bot (you) do you agree with @relay ({RELAY})?" in history
+    assert f"[assistant] @Alex Example ({HUMAN}) mostly, yes" in history
+    assert event.text == "@helper bot (you) and now?"
+
+
+async def _deliver_thread_reply(adapter, msg):
+    event = {**msg, "channel": "C0000000CHN", "channel_type": "channel"}
+    await adapter._handle_slack_message(event)
+    assert adapter.handle_message.await_count == 1, "thread reply was not dispatched"
+    return adapter.handle_message.await_args.args[0]
