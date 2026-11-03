@@ -54,6 +54,14 @@
    response", burned three turns, then blamed the judge model's JSON. The refusal is now a
    ``blocked`` verdict, so the goal pauses after the first turn and says the provider refused.
 
+8. The session prompt names the current Slack channel id.
+
+   Core's Slack session context says "DM with Casey" but never gives the channel id. The only
+   ``D...`` id in the prompt was the home channel (the owner's DM), so a coworker's DM session
+   read the owner's DM with the Slack tools, couldn't find the conversation, and quoted the
+   owner's private messages back. The Slack platform notes now name this chat's channel id
+   (and a real thread's ts) and say the home channel is a different chat.
+
 All of this patches private Hermes internals. When upstream renames one, the matching patch
 logs an error and that piece falls back to stock behavior. The gateway and the Slack adapter
 are often imported after this plugin registers, so patches apply to already-imported modules
@@ -316,6 +324,52 @@ def _make_call_goal_judge_llm(original):
     return _call_goal_judge_llm
 
 
+# ----- current channel id in the Slack session prompt --------------------------------
+
+
+def _slack_channel_lines(context) -> list:
+    src = getattr(context, "source", None)
+    chat_id = str(getattr(src, "chat_id", "") or "")
+    if not chat_id:
+        return []
+    lines = [f"**Current Slack channel id:** `{chat_id}`. Pass it as `channel_id` when you read "
+             "this chat with the Slack tools. The home channel listed below is a different chat; "
+             "never read it to answer someone here."]
+    if str(getattr(src, "chat_type", "") or "") == "dm":
+        lines.append("In this DM, top-level messages aren't threads: read context with "
+                     "`conversations_history` on this channel id, and use `conversations_replies` "
+                     "only when the message is a reply inside a real thread.")
+    return lines
+
+
+def _make_slack_platform_notes(original):
+    def _slack_platform_notes(context):
+        lines = list(original(context))
+        try:
+            lines.extend(_slack_channel_lines(context))
+        except Exception:
+            logger.exception("slack-multiplayer-enhancements: channel id note failed")
+        return lines
+
+    _slack_platform_notes.__wrapped__ = original
+    return _slack_platform_notes
+
+
+def _patch_session(module) -> None:
+    notes = getattr(module, "_PLATFORM_NOTES", None)
+    platform = getattr(getattr(module, "Platform", None), "SLACK", None)
+    original = notes.get(platform) if isinstance(notes, dict) and platform is not None else None
+    if original is None:
+        logger.error("slack-multiplayer-enhancements: gateway.session._PLATFORM_NOTES[SLACK] is gone; "
+                     "the channel id note is off")
+        return
+    if getattr(original, _PATCHED_FLAG, False):
+        return
+    patched = _make_slack_platform_notes(original)
+    setattr(patched, _PATCHED_FLAG, True)
+    notes[platform] = patched
+
+
 def _patch_goals(module) -> None:
     original = getattr(module, "_call_goal_judge_llm", None)
     if original is None:
@@ -397,6 +451,7 @@ _GATEWAY_PATCHES = {
     "gateway.response_filters": _patch_response_filters,
     "gateway.run_busy": _patch_run_busy,
     "gateway.run_inbound": _patch_run_inbound,
+    "gateway.session": _patch_session,
     "hermes_cli.goals": _patch_goals,
 }
 
