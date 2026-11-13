@@ -317,3 +317,97 @@ async def _deliver_thread_reply(adapter, msg):
     await adapter._handle_slack_message(event)
     assert adapter.handle_message.await_count == 1, "thread reply was not dispatched"
     return adapter.handle_message.await_args.args[0]
+
+
+# ---------------------------------------------------------------------------
+# Untagged follow-ups and edited mentions in an alert's thread
+# ---------------------------------------------------------------------------
+
+ALERT_ROOT = "1700000500.000000"
+
+
+class LiveSlackThread(FakeSlackThread):
+    """conversations.replies over a thread that keeps growing while the test runs."""
+
+    def post(self, user, text, ts, **extra):
+        msg = {"ts": ts, "thread_ts": ALERT_ROOT, "user": user, "text": text, **extra}
+        self.messages.append(msg)
+        return msg
+
+
+def _alert_thread_adapter():
+    thread = LiveSlackThread([
+        {"ts": ALERT_ROOT, "user": ALERTS, "bot_id": "B0000000ALR", "text": "deliver failed"}])
+    adapter = _adapter(FakeSlackUsers(USERS))
+    adapter.config.extra["require_mention"] = True
+    adapter._app.client.conversations_replies = thread.conversations_replies
+
+    async def chat_postMessage(channel, text, thread_ts=None, **_kw):
+        ts = f"1700000500.{len(thread.messages):06d}9"
+        thread.post(SELF, text, ts, bot_id="B0000000SLF")
+        return {"ok": True, "ts": ts, "channel": channel}
+
+    adapter._app.client.chat_postMessage = chat_postMessage
+    return adapter, thread
+
+
+def _human_reply(thread, text, ts):
+    msg = thread.post(HUMAN, text, ts, client_msg_id=f"m-{ts}", parent_user_id=ALERTS)
+    return {**msg, "type": "message", "channel": "C0000000CHN", "channel_type": "channel"}
+
+
+def test_untagged_follow_ups_reach_us_once_we_were_tagged_in_the_alert_thread():
+    adapter, thread = _alert_thread_adapter()
+
+    asyncio.run(adapter._handle_slack_message(
+        _human_reply(thread, f"<@{SELF}> did we handle this", "1700000500.000100")))
+    # Sent while our answer is still being written, then again after it landed.
+    asyncio.run(adapter._handle_slack_message(
+        _human_reply(thread, "and check the retries too", "1700000500.000200")))
+    asyncio.run(adapter.send("C0000000CHN", "not yet", reply_to="1700000500.000100",
+                             metadata={"thread_id": ALERT_ROOT}))
+    asyncio.run(adapter._handle_slack_message(
+        _human_reply(thread, "can you open a thread for it?", "1700000500.000300")))
+
+    texts = [c.args[0].text for c in adapter.handle_message.await_args_list]
+    assert texts == ["@helper bot (you) did we handle this", "and check the retries too",
+                     "can you open a thread for it?"]
+
+
+def test_untagged_follow_up_reaches_us_after_our_reply_outdated_the_saved_thread_copy():
+    adapter, thread = _alert_thread_adapter()
+    asyncio.run(adapter._fetch_thread_context(
+        channel_id="C0000000CHN", thread_ts=ALERT_ROOT, current_ts=""))
+    for entry in adapter._thread_context_cache.values():
+        entry.fetched_at -= 30  # saved half a minute ago, before we posted
+    thread.post(SELF, "found the cause", "1700000500.000200", bot_id="B0000000SLF")
+
+    asyncio.run(adapter._handle_slack_message(
+        _human_reply(thread, "nice, fix it", "1700000500.000300")))
+
+    assert [c.args[0].text for c in adapter.handle_message.await_args_list] == ["nice, fix it"]
+
+
+def test_editing_a_tag_into_an_ignored_reply_starts_exactly_one_turn():
+    orig_ts, edit_ts = "1700000500.000400", "1700000515.000000"
+    for order in ("mention first", "change first"):
+        adapter, thread = _alert_thread_adapter()
+        original = _human_reply(thread, "please read the above", orig_ts)
+        asyncio.run(adapter._handle_slack_message(original))
+        assert adapter.handle_message.await_count == 0
+
+        edited = {**original, "text": f"<@{SELF}>  please read the above",
+                  "edited": {"user": HUMAN, "ts": edit_ts}}
+        app_mention = {**edited, "type": "app_mention", "event_ts": edit_ts}
+        app_mention.pop("channel_type")
+        changed = {"type": "message", "subtype": "message_changed", "hidden": True,
+                   "channel": "C0000000CHN", "channel_type": "channel", "ts": edit_ts,
+                   "event_ts": edit_ts, "message": {k: v for k, v in edited.items()
+                                                     if k not in ("channel", "channel_type")},
+                   "previous_message": {"ts": orig_ts, "user": HUMAN, "text": original["text"]}}
+        events = [app_mention, changed] if order == "mention first" else [changed, app_mention]
+        for event in events:
+            asyncio.run(adapter._handle_slack_message(event))
+
+        texts = [c.args[0].text for c in adapter.handle_message.await_args_list]
+        assert texts == ["@helper bot (you)  please read the above"], order

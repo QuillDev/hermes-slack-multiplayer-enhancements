@@ -22,7 +22,11 @@
    message for us and we answered turns meant for it. Before the adapter sees a channel
    message, drop it when it @mentions others but not us, or when it's an untagged reply in a
    thread another bot started and we never posted in. DMs, our own threads and messages that
-   tag us are unchanged.
+   tag us are unchanged. A thread we were tagged in earlier counts as ours, so a follow-up
+   sent while our answer is still being written arrives. A dropped message still counts as
+   seen (as core's own filter would record it), so an edit that adds our mention, which Slack
+   sends twice (an app_mention and a message_changed), starts one turn instead of a second
+   copy that fails admission.
 
 4. Wake on replies in threads we posted in.
 
@@ -30,7 +34,9 @@
    in it, or already has a session there. A note posted with a raw chat.postMessage under
    someone else's root (an alert integration's message) doesn't count, so a human follow-up
    there never reached us. Now any message of ours in the thread counts. It reads the thread
-   from Slack (cache first), so it also holds after a restart.
+   from Slack (cache first), so it also holds after a restart. A cached copy that says we
+   never posted is re-read when it is more than a few seconds old, since it may predate our
+   own reply.
 
 5. Name the sender on mid-turn messages in shared chats.
 
@@ -77,12 +83,15 @@ import logging
 import os
 import re
 import sys
+import time
 
 logger = logging.getLogger(__name__)
 
 _ADAPTER_SUFFIX = os.path.join("plugins", "platforms", "slack", "adapter.py")
 _PATCHED_FLAG = "_sme_mention_targets_patched"
 _MENTION_RE = re.compile(r"<@([A-Z0-9]+)(?:\|[^>]*)?>")
+# A thread copy read this recently is trusted without another conversations.replies call.
+_FRESH_THREAD_SECONDS = 5.0
 
 
 # ----- mention targets -------------------------------------------------------
@@ -185,12 +194,37 @@ async def _addressed_elsewhere(adapter, event: dict) -> bool:
         return False
     if not await adapter._resolve_user_is_bot(parent, chat_id=chat_id, team_id=team_id):
         return False
-    return not await _bot_replied_in_thread(adapter, chat_id, thread_ts, team_id)
+    if _tagged_in_thread(adapter, thread_ts, team_id):
+        return False
+    return not await _bot_replied_in_thread(adapter, chat_id, thread_ts, team_id, refresh=True)
+
+
+def _tagged_in_thread(adapter, thread_ts: str, team_id: str) -> bool:
+    """True when someone tagged us in the thread during this run (core remembers it in memory).
+    It covers a follow-up sent while our reply to that tag is still being written."""
+    seen = getattr(adapter, "_mentioned_threads", None) or ()
+    return adapter._workspace_message_marker(team_id, thread_ts) in seen or thread_ts in seen
+
+
+def _mark_dropped_as_seen(adapter, event: dict, payload) -> None:
+    """Record a dropped message's ts the way core's prefilter would have. Slack sends an edit
+    that adds a mention twice (an app_mention under the original ts plus a message_changed);
+    core lets only one through because the original ts is already seen. Dropping before core
+    skipped that, so both copies ran and the second failed admission as a conflict."""
+    ts = event.get("ts")
+    if not ts:
+        return
+    try:
+        adapter._dedup.is_duplicate(
+            adapter._workspace_event_id(adapter._event_team_id(event, payload), ts))
+    except Exception:
+        logger.exception("slack-multiplayer-enhancements: could not mark a dropped message as seen")
 
 
 def _make_handle_slack_message(original):
     async def _handle_slack_message(self, event, payload=None):
         if await _addressed_elsewhere(self, event):
+            _mark_dropped_as_seen(self, event, payload)
             return None
         return await original(self, event, payload)
     _handle_slack_message.__wrapped__ = original
@@ -200,22 +234,35 @@ def _make_handle_slack_message(original):
 # ----- wake on threads we posted in --------------------------------------------
 
 
-async def _bot_replied_in_thread(adapter, channel_id: str, thread_ts: str, team_id: str = "") -> bool:
+async def _bot_replied_in_thread(adapter, channel_id: str, thread_ts: str, team_id: str = "",
+                                 refresh: bool = False) -> bool:
     """True when any message in the thread was posted by this bot. Reads conversations.replies
-    through the adapter's thread cache, fetching once on a miss."""
+    through the adapter's thread cache, fetching once on a miss. A cached copy can predate our
+    own reply (it is saved when the thread is first read), so with ``refresh`` a cached "no"
+    older than a few seconds is re-read from Slack before it counts."""
     if not thread_ts:
         return False
     bot_uid = adapter._team_bot_user_ids.get(team_id, adapter._bot_user_id) or ""
     if not bot_uid:
         return False
-    for attempt in range(2):
+
+    def cached():
         for key, entry in adapter._thread_context_cache.items():
             if key.startswith(f"{channel_id}:{thread_ts}:"):
-                return any((m or {}).get("user") == bot_uid for m in (entry.messages or []))
-        if attempt == 0:
-            await adapter._fetch_thread_context(
-                channel_id=channel_id, thread_ts=thread_ts, current_ts="", team_id=team_id)
-    return False
+                return entry
+        return None
+
+    entry = cached()
+    if entry is not None:
+        if any((m or {}).get("user") == bot_uid for m in (entry.messages or [])):
+            return True
+        if not refresh or time.monotonic() - entry.fetched_at < _FRESH_THREAD_SECONDS:
+            return False
+    await adapter._fetch_thread_context(channel_id=channel_id, thread_ts=thread_ts, current_ts="",
+                                        team_id=team_id, force_refresh=entry is not None)
+    entry = cached()
+    return entry is not None and any(
+        (m or {}).get("user") == bot_uid for m in (entry.messages or []))
 
 
 def _make_should_wake(original):
@@ -228,7 +275,7 @@ def _make_should_wake(original):
         bound.apply_defaults()
         a = bound.arguments
         return bool(a["is_thread_reply"] and await _bot_replied_in_thread(
-            self, a["channel_id"], a["event_thread_ts"], a.get("team_id") or ""))
+            self, a["channel_id"], a["event_thread_ts"], a.get("team_id") or "", refresh=True))
     _should_wake_on_unmentioned_message.__wrapped__ = original
     return _should_wake_on_unmentioned_message
 
