@@ -151,7 +151,7 @@ _IDENTITY_NOTE = (
 
 
 def _make_thread_context_line(original):
-    async def _thread_context_line(self, msg, msg_text, is_parent, team_id, channel_id):
+    async def _thread_context_line(self, msg, msg_text, is_parent, team_id, channel_id, **kwargs):
         # Core strips our own mention before this runs. Put it back when that is the only
         # difference, so it can read "(you)", then humanize like a live message.
         bot_uid = self._team_bot_user_ids.get(team_id, self._bot_user_id) or ""
@@ -163,7 +163,7 @@ def _make_thread_context_line(original):
             if full and full.replace(f"<@{bot_uid}>", "").strip() == msg_text:
                 msg_text = full
         msg_text = await self._humanize_user_mentions(msg_text, chat_id=channel_id, team_id=team_id)
-        return await original(self, msg, msg_text, is_parent, team_id, channel_id)
+        return await original(self, msg, msg_text, is_parent, team_id, channel_id, **kwargs)
     _thread_context_line.__wrapped__ = original
     return _thread_context_line
 
@@ -320,11 +320,23 @@ def _shared_sender_label(runner, source):
 
 
 def _make_steer_text_with_origin(original):
+    from gateway import session
+
+    core_labels_sender = callable(getattr(session, "label_shared_sender", None))
+
     def _steer_text_with_origin(self, text, event):
-        if text.strip() and event is not None and not getattr(event, "internal", False):
-            sender = _shared_sender_label(self, event.source)
-            if sender:
-                text = f"{_SHARED_STEER_NOTE}[{sender}] {text}"
+        if text.strip() and event is not None:
+            if getattr(event, "internal", False) and core_labels_sender:
+                from dataclasses import replace
+                from gateway.session_identity import replace_source
+
+                event = replace(event, source=replace_source(event.source, user_name=None))
+            elif not getattr(event, "internal", False):
+                sender = _shared_sender_label(self, event.source)
+                if sender:
+                    if core_labels_sender:
+                        return _SHARED_STEER_NOTE + original(self, text, event)
+                    text = f"{_SHARED_STEER_NOTE}[{sender}] {text}"
         return original(self, text, event)
     _steer_text_with_origin.__wrapped__ = original
     return _steer_text_with_origin
