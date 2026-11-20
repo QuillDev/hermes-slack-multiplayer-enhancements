@@ -608,10 +608,10 @@ def _make_send_native_task_card_progress_runner(original):
 def _make_native_task_card_key(original):
     def _native_task_card_key(self, chat_id, reply_to, metadata):
         key = original(self, chat_id, reply_to, metadata)
-        if key is not None or str(chat_id or "").startswith("D"):
+        if key is not None:
             return key
-        # Flat replies (reply_in_thread: false) leave a top-level channel message with no
-        # thread; start one on the message itself so the card has somewhere to live.
+        # Flat replies (reply_in_thread: false) leave a top-level message (channel or DM) with
+        # no thread; start one on the message itself so the card has somewhere to live.
         anchor = (metadata or {}).get(_CARD_ANCHOR)
         if not anchor:
             return None
