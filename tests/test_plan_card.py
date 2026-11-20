@@ -62,9 +62,11 @@ def _isolated_home(tmp_path, monkeypatch):
 class FakeSlack:
     """Slack's Web API over HTTP: keeps the messages a channel would show."""
 
-    def __init__(self, fail=(), fail_once=()):
+    def __init__(self, fail=(), fail_once=(), flaky=()):
         self.fail = set(fail)
         self.fail_once = set(fail_once)
+        self.flaky = set(flaky)  # every other call fails, starting with the first
+        self.final_refused = False
         self.calls = []
         self.call_times = []
         self.messages = {}  # ts -> {"thread_ts", "chunks", "streaming", "text"}
@@ -79,6 +81,13 @@ class FakeSlack:
         if method in self.fail_once:
             self.fail_once.discard(method)
             return aiohttp_web.json_response({"ok": False, "error": "ratelimited"})
+        if method in self.flaky:
+            # The turn's last edit (nothing left running) is refused the first time too.
+            tasks = [t for b in body.get("blocks") or [] if b.get("type") == "plan" for t in b["tasks"]]
+            last_edit = method == "chat.update" and tasks and all(t["status"] != "in_progress" for t in tasks)
+            if (last_edit and not self.final_refused) or sum(m == method for m, _ in self.calls) % 2 == 1:
+                self.final_refused = self.final_refused or bool(last_edit)
+                return aiohttp_web.json_response({"ok": False, "error": "ratelimited"})
         if method in self.fail:
             return aiohttp_web.json_response({"ok": False, "error": "internal_error"})
         if method == "chat.startStream":
@@ -299,7 +308,9 @@ async def test_top_level_turn_keeps_a_flat_card_above_its_one_answer(monkeypatch
     # Shown running, then ended with its result (the flat pace may fold a short step's frames).
     states = fake.flat_task_states()
     assert states["call-1"] == ["in_progress", "complete"] and states["call-2"][-1] == "error"
-    assert _left(fake) == [[("checking slack", "complete"), ("running a query", "error")], result["final_response"]]
+    # Every step stays, in order: each thinking phase and each tool.
+    assert _left(fake) == [[("thinking", "complete"), ("checking slack", "complete"), ("thinking", "complete"),
+                            ("running a query", "error"), ("thinking", "complete")], result["final_response"]]
     # Nothing opened a thread.
     assert not any(body.get("thread_ts") for _, body in fake.calls)
     assert "chat.startStream" not in [m for m, _ in fake.calls]
@@ -317,6 +328,51 @@ async def test_top_level_chat_turn_keeps_its_card_and_a_silent_one_leaves_nothin
     assert fake.plan_frames()  # the card was up while the turn ran
     expected = [] if agent_cls is SilentToolAgent else [[("thinking", "complete")], result["final_response"]]
     assert _left(fake) == expected
+
+
+class StepsAgent(ToolAgent):
+    """Thinks, runs a command, thinks, reads a file, thinks, answers."""
+    final = "all done"
+
+    def run_conversation(self, message, conversation_history=None, task_id=None, **kwargs):
+        for call_id, tool in (("call-a", "terminal"), ("call-b", "read_file")):
+            time.sleep(0.8)  # thinking
+            self.start(call_id, tool, {})
+            time.sleep(0.8)
+            self.complete(call_id, tool, {}, "{}")
+        time.sleep(0.8)
+        return {"final_response": self.final, "messages": [], "api_calls": 1}
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("flaky", [False, True], ids=["steady", "dropped-edits"])
+async def test_every_step_of_a_turn_stays_on_the_card_in_order(monkeypatch, tmp_path, slack, flaky):
+    fake = await slack(flaky={"chat.update"} if flaky else ())
+
+    await _turn(monkeypatch, tmp_path, fake, StepsAgent, where="dm")
+
+    assert _left(fake) == [[("thinking", "complete"), ("running a command", "complete"), ("thinking", "complete"),
+                            ("reading files", "complete"), ("thinking", "complete")], StepsAgent.final]
+
+
+@pytest.mark.asyncio
+async def test_a_long_turn_keeps_steps_that_scrolled_out_of_cores_window(monkeypatch, tmp_path, slack):
+    class LongAgent(ToolAgent):
+        def run_conversation(self, message, conversation_history=None, task_id=None, **kwargs):
+            for i in range(6):
+                self.start(f"call-{i}", "web_search", {"query": str(i)})
+                time.sleep(0.4)
+                self.complete(f"call-{i}", "web_search", {"query": str(i)}, "{}")
+                time.sleep(0.4)
+            return {"final_response": "done", "messages": [], "api_calls": 1}
+
+    fake = await slack()
+
+    await _turn(monkeypatch, tmp_path, fake, LongAgent, where="dm")
+
+    # 13 steps: core only sends its last 8 at a time, the card still shows all of them.
+    assert _left(fake) == [[("thinking", "complete")] + [("searching the web", "complete"), ("thinking", "complete")] * 6,
+                           "done"]
 
 
 @pytest.mark.asyncio
