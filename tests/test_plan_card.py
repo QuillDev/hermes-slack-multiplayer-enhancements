@@ -547,3 +547,94 @@ async def test_bursts_of_tool_events_are_coalesced(monkeypatch, tmp_path, slack)
     states = fake.task_states()
     assert len(states) == 20
     assert {seq[-1] for seq in states.values()} == {"complete"}
+
+
+class QuietAgent(ToolAgent):
+    """Reads the message and stays out of it: no tools, a bare silence marker."""
+
+    def run_conversation(self, message, conversation_history=None, task_id=None, **kwargs):
+        time.sleep(0.3)
+        return {"final_response": "NO_REPLY", "messages": [], "api_calls": 1}
+
+
+class SlowToolAgent(ToolAgent):
+    """One tool that runs past a status refresh, then answers. Reports it on both rails the real
+    agent uses: the tool callbacks and the progress events."""
+
+    def __init__(self, **kwargs):
+        super().__init__(**kwargs)
+        self.tool_progress_callback = None
+
+    def run_conversation(self, message, conversation_history=None, task_id=None, **kwargs):
+        args = {"channel_id": CHANNEL}
+        self.start("call-1", "mcp__slack__conversations_history", args)
+        self.tool_progress_callback("tool.started", "mcp__slack__conversations_history", None, args)
+        time.sleep(2.5)
+        self.complete("call-1", "mcp__slack__conversations_history", args, '{"ok": true}')
+        self.tool_progress_callback("tool.completed", "mcp__slack__conversations_history", None, args)
+        return {"final_response": self.final, "messages": [], "api_calls": 1}
+
+
+async def _status_turn(monkeypatch, tmp_path, fake, agent_cls, *, tagged):
+    """A turn on a reply inside an existing channel thread, with the typing refresh the gateway's
+    message handler runs around it: started before the agent, stopped after the reply."""
+    from gateway.platforms.base import _thread_metadata_for_source
+    from gateway.platforms.event import MessageEvent
+    from gateway.platforms.helpers import typing_metadata_for_turn
+    from gateway.response_filters import is_intentional_silence_agent_result
+
+    fake_dotenv = types.ModuleType("dotenv")
+    fake_dotenv.load_dotenv = lambda *args, **kwargs: None
+    monkeypatch.setitem(sys.modules, "dotenv", fake_dotenv)
+    fake_run_agent = types.ModuleType("run_agent")
+    fake_run_agent.AIAgent = agent_cls
+    monkeypatch.setitem(sys.modules, "run_agent", fake_run_agent)
+    adapter = SlackAdapter(PlatformConfig(enabled=True, token="xoxb-test", extra={
+        "reply_in_thread": False, "dm_top_level_threads_as_sessions": False, "native_task_cards": True}))
+    adapter._app = SimpleNamespace(client=fake.client)
+    runner = _make_runner(adapter)
+    gateway_run = importlib.import_module("gateway.run")
+    monkeypatch.setattr(gateway_run, "_hermes_home", tmp_path)
+    monkeypatch.setattr(gateway_run, "_resolve_runtime_agent_kwargs", lambda: {"api_key": "***"})
+    source = SessionSource(platform=Platform.SLACK, chat_id=CHANNEL, chat_type="group", thread_id=ROOT_TS,
+                           user_id="U0000000001", scope_id="T0000000001")
+    event = MessageEvent(text="hello", source=source, message_id=MESSAGE_TS,
+                         reply_expected=True if tagged else None)
+    metadata = typing_metadata_for_turn(adapter, CHANNEL, MESSAGE_TS, _thread_metadata_for_source(source, MESSAGE_TS))
+    typing = adapter._start_typing_refresh(event, asyncio.Event(), metadata)
+    result = await runner._run_agent(
+        message="hello", context_prompt="", history=[], source=source, session_id="sess-status",
+        session_key=f"agent:main:slack:group:{CHANNEL}:{ROOT_TS}", event_message_id=MESSAGE_TS)
+    if not is_intentional_silence_agent_result(result, result.get("final_response")):
+        await adapter.send(CHANNEL, result["final_response"], reply_to=MESSAGE_TS, metadata=metadata)
+    await adapter._stop_typing_refresh(CHANNEL, typing, metadata=metadata, event=event)
+    return fake.status_shown.get(ROOT_TS, [])
+
+
+@pytest.mark.asyncio
+async def test_an_untagged_thread_reply_the_bot_stays_out_of_shows_no_status(monkeypatch, tmp_path, slack):
+    fake = await slack()
+
+    shown = await _status_turn(monkeypatch, tmp_path, fake, QuietAgent, tagged=False)
+
+    assert shown == []
+    assert not [m for m, _ in fake.calls if m.endswith("setStatus")]
+    assert fake.messages == {}
+
+
+@pytest.mark.asyncio
+async def test_an_untagged_thread_reply_shows_the_status_once_the_bot_starts_working(monkeypatch, tmp_path, slack):
+    fake = await slack()
+
+    shown = await _status_turn(monkeypatch, tmp_path, fake, SlowToolAgent, tagged=False)
+
+    assert shown and shown[0] != "" and shown[-1] == ""  # shown while working, cleared at the end
+
+
+@pytest.mark.asyncio
+async def test_a_tagged_thread_reply_shows_the_status_right_away(monkeypatch, tmp_path, slack):
+    fake = await slack()
+
+    shown = await _status_turn(monkeypatch, tmp_path, fake, QuietAgent, tagged=True)
+
+    assert shown and shown[0] == "is thinking..." and shown[-1] == ""
