@@ -70,15 +70,15 @@
 
 9. Slack plan card: live tool progress that says nothing it shouldn't.
 
-   With core's ``platforms.slack.extra.native_task_cards`` on, a tool-using turn shows a
-   Slack plan block in the message's thread. This plugin titles it "working on it", names each
-   task by its kind ("checking slack", "running a query") instead of the tool name and its
+   With core's ``platforms.slack.extra.native_task_cards`` on, a tool-using turn on a message
+   inside a thread shows a Slack plan block there. This plugin titles it "working on it", names
+   each task by its kind ("checking slack", "running a query") instead of the tool name and its
    arguments, and marks a failed call as an error with no error text. Frames go out at most
    once a second, folding bursts together, and a task that finished after scrolling out of the
-   card's last-eight window still gets its final state. With flat replies
-   (``reply_in_thread: false``) a top-level channel message gets a thread for the card; DMs
-   don't. A turn that ends silent (NO_REPLY) deletes its card, and a streaming error stays
-   quiet instead of posting core's text progress fallback, unless ``tool_progress`` was set.
+   card's last-eight window still gets its final state. A top-level message gets no card (the bot
+   never opens a thread); the status line names its steps instead. A turn that ends silent
+   (NO_REPLY) deletes its card, and a streaming error stays quiet instead of posting core's text
+   progress fallback, unless ``tool_progress`` was set.
 
 10. An edit to an old Slack message never posts "already received a different message".
 
@@ -478,7 +478,6 @@ _PLAN_TITLE = "working on it"
 # Slack allows chat.appendStream at Tier 4 (100+/min); one frame a second stays well under it.
 _CARD_MIN_INTERVAL = 1.0
 _CARD_TS_ATTR = "_sme_card_ts"
-_CARD_ANCHOR = "sme_card_anchor_ts"
 _CARD_LABELS = (
     (("send_message",), "sending a message"),
     (("slack",), "checking slack"),
@@ -503,34 +502,12 @@ def _card_label(tool_name) -> str:
     return "using a tool"
 
 
-_THINKING_PREFIX = "sme_thinking_"
-
-
-def _thinking_task(state, status):
-    task_id = f"{_THINKING_PREFIX}{sum(i.startswith(_THINKING_PREFIX) for i in state.task_order) + 1}"
-    state.task_order.append(task_id)
-    state.tasks[task_id] = {"id": task_id, "title": "thinking", "status": status}
-
-
 def _make_apply_event(original):
     def apply_event(self, raw):
-        kind = raw.get("type") if isinstance(raw, dict) else None
-        if kind in {"tool.started", "tool.completed"}:
-            raw = {"type": kind, "tool_call_id": raw.get("tool_call_id"),
+        if isinstance(raw, dict) and raw.get("type") in {"tool.started", "tool.completed"}:
+            raw = {"type": raw["type"], "tool_call_id": raw.get("tool_call_id"),
                    "tool_name": _card_label(raw.get("tool_name")), "is_error": raw.get("is_error")}
-        if kind == "tool.started":
-            # The thinking that led to this tool is over. The turn opened with thinking, so the
-            # first tool gets that step in front of it (the flat card already shows it running).
-            if not self.task_order:
-                _thinking_task(self, "complete")
-            for task in self.tasks.values():
-                if task["id"].startswith(_THINKING_PREFIX) and task["status"] == "in_progress":
-                    task["status"] = "complete"
-        changed = original(self, raw)
-        if kind == "tool.completed" and changed and \
-                not any(t["status"] == "in_progress" for t in self.tasks.values()):
-            _thinking_task(self, "in_progress")  # every tool is done: back to thinking
-        return changed
+        return original(self, raw)
     apply_event.__wrapped__ = original
     return apply_event
 
@@ -546,8 +523,7 @@ def _make_task_card_publish(original):
         cancelling = bool(task and task.cancelling())
         cancelled = None
         if last is not None and not cancelling:
-            flat = _flat_card(st.adapter, self._ctx.source.chat_id, self._ctx._progress_metadata) is not None
-            wait = last + (_FLAT_CARD_MIN_INTERVAL if flat else _CARD_MIN_INTERVAL) - time.monotonic()
+            wait = last + _CARD_MIN_INTERVAL - time.monotonic()
             if wait > 0:
                 try:
                     await asyncio.sleep(wait)
@@ -607,7 +583,6 @@ def _turn_was_silent(ctx) -> bool:
 async def _drop_turn_cards(runner, adapter) -> None:
     """Forget this turn's cards; delete them when the turn ended silent (NO_REPLY)."""
     ctx = runner._ctx
-    await _finish_flat_card(adapter, ctx)
     key_fn = getattr(adapter, "_native_task_card_key", None)
     cards = getattr(adapter, _CARD_TS_ATTR, None)
     if not callable(key_fn) or not isinstance(cards, dict):
@@ -640,16 +615,6 @@ def _make_send_native_task_card_progress_runner(original):
 def _make_send_native_task_card_progress(original):
     async def send_native_task_card_progress(self, chat_id, tasks, *, title=None, reply_to=None,
                                              metadata=None, fallback_text=None):
-        if self._native_task_card_key(chat_id, reply_to, metadata) is None:
-            card = _flat_card(self, chat_id, metadata)
-            if card is not None:
-                return await _update_flat_card(self, card, tasks)
-        # Thinking steps are for the flat card: a thread card's stream can't finish the last one,
-        # which would spin on after the answer.
-        tasks = [t for t in tasks if not str(t.get("id", "")).startswith(_THINKING_PREFIX)]
-        if not tasks:
-            from gateway.platforms.base import SendResult
-            return SendResult(success=True)
         result = await original(self, chat_id, tasks, title=_PLAN_TITLE, reply_to=reply_to,
                                 metadata=metadata, fallback_text=fallback_text)
         stamp = getattr(result, "message_id", None) if getattr(result, "success", False) else None
@@ -664,168 +629,44 @@ def _make_send_native_task_card_progress(original):
     return send_native_task_card_progress
 
 
-# The bot never opens a thread itself, so a top-level message (channel or DM) gets a flat card: a
-# plain message with a plan block, posted when the turn starts and edited as tools run. When the
-# answer lands the card stays above it with its steps finished; a silent turn deletes it. A message
-# already in a thread keeps core's in-thread card.
-_FLAT_CARDS_ATTR = "_sme_flat_cards"
-_FLAT_GATE_ATTR = "_sme_flat_gate"
-_FLAT_CARD_MIN_INTERVAL = 1.5  # per card
-_FLAT_UPDATE_GAP = 1.2  # across every card in the process: chat.update is Tier 3 (~50/min)
-_FLAT_CARD_START = {"id": "sme_thinking_1", "title": "thinking", "status": "in_progress"}
-_FLAT_CARD_MAX_TASKS = 50  # Slack's plan block limit
-_FLAT_BLOCK_ID = "sme_plan"
-_FLAT_DELETE_TRIES = 3
-_FLAT_FINAL_TRIES = 3
-_SETTLED = {"complete", "error"}
-
-
-def _flat_plan(card):
-    tasks = list(card["tasks"].values())[-_FLAT_CARD_MAX_TASKS:]
-    # One block_id for the card's whole life: a new id on each edit (Slack's docs suggest one, and
-    # Slack makes one when it's left out) re-renders the plan and snaps an opened card shut.
-    return [{"type": "plan", "block_id": _FLAT_BLOCK_ID, "title": _PLAN_TITLE,
-             "tasks": [{"task_id": t["id"], "title": t["title"], "status": t["status"]} for t in tasks]}]
-
-
-def _flat_card(adapter, chat_id, metadata):
-    anchor = (metadata or {}).get(_CARD_ANCHOR)
-    return adapter.__dict__.get(_FLAT_CARDS_ATTR, {}).get((str(chat_id), str(anchor))) if anchor else None
-
-
-def _wants_flat_card(adapter, event) -> bool:
-    source = getattr(event, "source", None)
-    message_id = getattr(event, "message_id", None)
-    thread_id = getattr(source, "thread_id", None)
-    kind = getattr(getattr(event, "message_type", None), "name", "")
-    reacting = getattr(adapter, "_reacting_target", None)
-    return (bool(getattr(source, "chat_id", None)) and bool(message_id) and kind != "COMMAND"
-            and (not thread_id or str(thread_id) == str(message_id))
-            and callable(reacting) and reacting(event) is not None  # only messages the bot takes up
-            and not adapter.config.extra.get("reply_in_thread", True)
-            and adapter.native_task_cards_enabled())
-
-
-async def _flat_call(adapter, card, method, payload):
-    """One Slack call for a card; edits are spaced across all cards so busy channels stay under
-    chat.update's limit."""
-    import asyncio
-    client = adapter._get_client(card["chat"], team_id=card["team"])
-    if method != "chat.update":
-        return await client.api_call(method, json=payload)
-    gate = adapter.__dict__.setdefault(_FLAT_GATE_ATTR, {"lock": asyncio.Lock(), "last": 0.0})
-    async with gate["lock"]:
-        wait = gate["last"] + _FLAT_UPDATE_GAP - time.monotonic()
-        if wait > 0:
-            await asyncio.sleep(wait)
-        try:
-            return await client.api_call(method, json=payload)
-        finally:
-            gate["last"] = time.monotonic()
-
-
 def _make_on_processing_start(original):
-    import asyncio
-
     async def on_processing_start(self, event):
-        # No eyes reaction: the "is working" status under the message shows the turn instead.
-        try:
-            if not _wants_flat_card(self, event):
-                return
-            chat_id, team_id = str(event.source.chat_id), str(getattr(event.source, "scope_id", "") or "")
-            card = {"chat": chat_id, "team": team_id, "ts": None, "lock": asyncio.Lock(),
-                    "tasks": {_FLAT_CARD_START["id"]: dict(_FLAT_CARD_START)}}
-            resp = await _flat_call(self, card, "chat.postMessage",
-                                    {"channel": chat_id, "text": _PLAN_TITLE, "blocks": _flat_plan(card)})
-            card["ts"] = str(resp["ts"])
-            self.__dict__.setdefault(_FLAT_CARDS_ATTR, {})[(chat_id, str(event.message_id))] = card
-        except Exception as exc:
-            logger.warning("slack-multiplayer-enhancements: couldn't post the plan card: %s", exc)
+        # The "is working" status under the message shows the turn instead of the eyes, in DMs and
+        # threads. Slack shows no status under a top-level channel message, so that keeps the eyes.
+        source = getattr(event, "source", None)
+        if not _shows_status(str(getattr(source, "chat_id", "") or ""), getattr(source, "thread_id", None),
+                             getattr(event, "message_id", None)):
+            return await original(self, event)
+        return None
     on_processing_start.__wrapped__ = original
     return on_processing_start
 
 
-async def _delete_flat_card(adapter, card) -> None:
-    import asyncio
-    async with card["lock"]:
-        card["ts"], ts = None, card["ts"]
-        if not ts:
-            return
-        for attempt in range(_FLAT_DELETE_TRIES):
-            try:
-                await _flat_call(adapter, card, "chat.delete", {"channel": card["chat"], "ts": ts})
-                return
-            except Exception as exc:
-                if "message_not_found" in str(exc) or attempt == _FLAT_DELETE_TRIES - 1:
-                    logger.warning("slack-multiplayer-enhancements: couldn't delete the plan card: %s", exc)
-                    return
-                await asyncio.sleep(2 ** attempt)
+def _make_build_status_phrase(original):
+    # The status line under a message is the turn's only progress view, so it names each step
+    # the way the plan card did ("is running a command…"): never a tool name or its arguments.
+    def build_status_phrase(tool_name, args=None, max_len=49):
+        if not tool_name or tool_name == "_thinking":
+            return original(tool_name, args, max_len)
+        return f"is {_card_label(tool_name)}…"
+    build_status_phrase.__wrapped__ = original
+    return build_status_phrase
 
 
-async def _finish_flat_card(adapter, ctx) -> None:
-    """At turn end: a silent turn deletes its card; otherwise the card stays above the answer with
-    its running steps marked done."""
-    card = _flat_card(adapter, ctx.source.chat_id, ctx._progress_metadata)
-    if card is None or card.get("done"):
+def _patch_display(module) -> None:
+    original = getattr(module, "build_status_phrase", None)
+    if original is None:
+        logger.error("slack-multiplayer-enhancements: build_status_phrase is gone; status lines keep core's wording")
         return
-    if _turn_was_silent(ctx):
-        await _delete_flat_card(adapter, card)
-        return
-    card["done"] = True
-    await _update_flat_card(adapter, card, [])
+    if getattr(original, "__wrapped__", None) is None:
+        module.build_status_phrase = _make_build_status_phrase(original)
 
 
-def _make_on_processing_complete(original):
-    async def on_processing_complete(self, event, outcome):
-        try:
-            return await original(self, event, outcome)
-        finally:
-            key = (str(getattr(event.source, "chat_id", "")), str(getattr(event, "message_id", "")))
-            card = self.__dict__.get(_FLAT_CARDS_ATTR, {}).pop(key, None)
-            if card is not None and not card.get("done"):
-                # The turn never reached an answer (it failed or was cut short): no card left over.
-                await _delete_flat_card(self, card)
-    on_processing_complete.__wrapped__ = original
-    return on_processing_complete
-
-
-async def _update_flat_card(adapter, card, tasks):
-    """Fold a frame into the card and write the whole card. A frame holds only core's recent steps,
-    so the card keeps every step it has seen, in the order they began."""
-    import asyncio
-    from gateway.platforms.base import SendResult
-    async with card["lock"]:
-        if not card["ts"]:
-            return SendResult(success=False, error="Progress stream already stopped")
-        for task in tasks:
-            card["tasks"][task["id"]] = {"id": task["id"], "title": task["title"], "status": task["status"]}
-        if card.get("done"):
-            for seen in card["tasks"].values():
-                if seen["status"] not in _SETTLED:
-                    seen["status"] = "complete"
-        # A dropped edit (rate limit, blip) is caught up by the next one, which carries every step;
-        # the turn's last edit has no next one, so it retries.
-        tries = _FLAT_FINAL_TRIES if card.get("done") else 1
-        for attempt in range(tries):
-            try:
-                await _flat_call(adapter, card, "chat.update", {
-                    "channel": card["chat"], "ts": card["ts"], "text": _PLAN_TITLE, "blocks": _flat_plan(card)})
-                break
-            except Exception as exc:
-                logger.debug("slack-multiplayer-enhancements: plan card edit failed: %s", exc)
-                if attempt < tries - 1:
-                    await asyncio.sleep(2 ** attempt)
-        return SendResult(success=True, message_id=card["ts"])
-
-
-def _make_native_task_card_destination_supported(original):
-    def native_task_card_destination_supported(self, chat_id, *, reply_to=None, metadata=None):
-        if self._native_task_card_key(chat_id, reply_to, metadata) is None and \
-                _flat_card(self, chat_id, metadata) is not None:
-            return True
-        return original(self, chat_id, reply_to=reply_to, metadata=metadata)
-    native_task_card_destination_supported.__wrapped__ = original
-    return native_task_card_destination_supported
+def _shows_status(chat_id, thread_id, message_id) -> bool:
+    """Slack draws the status in a thread, and under a top-level DM message; not under a
+    top-level channel message."""
+    in_thread = bool(thread_id) and str(thread_id) != str(message_id)
+    return in_thread or str(chat_id).startswith("D")
 
 
 def _status_metadata_for_turn(self, chat_id, anchor, metadata):
@@ -833,7 +674,8 @@ def _status_metadata_for_turn(self, chat_id, anchor, metadata):
     showed no status for it. Slack shows a status set on the message's own ts right under it,
     without opening a thread, so a message that would have got the eyes gets it there."""
     md = dict(metadata or {})
-    if md.get("thread_id") or md.get("thread_ts") or self.config.extra.get("reply_in_thread", True):
+    if md.get("thread_id") or md.get("thread_ts") or self.config.extra.get("reply_in_thread", True) \
+            or not _shows_status(chat_id, None, anchor):
         return md
     marker = self._workspace_message_marker(str(md.get("slack_team_id") or ""), str(anchor))
     if marker in self._reacting_message_ids:
@@ -924,30 +766,6 @@ def _patch_adapter_module(module) -> None:
         module._session_status_method = _make_session_status_method(original)
 
 
-def _make_run_agent_progress_threading(original):
-    def _run_agent_progress_threading(self, source, event_message_id, native_slack_task_cards):
-        metadata, reply_to, status_metadata = original(
-            self, source, event_message_id, native_slack_task_cards)
-        if native_slack_task_cards and event_message_id:
-            # Core drops a top-level message's own ts when replies are flat; keep it for the card.
-            metadata = dict(metadata or {})
-            metadata.setdefault(_CARD_ANCHOR, str(event_message_id))
-        return metadata, reply_to, status_metadata
-    _run_agent_progress_threading.__wrapped__ = original
-    return _run_agent_progress_threading
-
-
-def _patch_run_turn(module) -> None:
-    cls = getattr(module, "GatewayTurnMixin", None)
-    if cls is None:
-        logger.error("slack-multiplayer-enhancements: GatewayTurnMixin is gone; the plan card anchor is off")
-        return
-    if getattr(cls, _PATCHED_FLAG, False):
-        return
-    _wrap_method(cls, "_run_agent_progress_threading", _make_run_agent_progress_threading)
-    setattr(cls, _PATCHED_FLAG, True)
-
-
 def _patch_run_turn_progress(module) -> None:
     cls = getattr(module, "GatewayTurnProgressMixin", None)
     state = getattr(cls, "_TaskCardState", None)
@@ -986,9 +804,7 @@ def _patch_adapter_class(cls) -> bool:
     _wrap_method(cls, "_should_wake_on_unmentioned_message", _make_should_wake)
     _wrap_method(cls, "_thread_context_line", _make_thread_context_line)
     _wrap_method(cls, "send_native_task_card_progress", _make_send_native_task_card_progress)
-    _wrap_method(cls, "native_task_card_destination_supported", _make_native_task_card_destination_supported)
     _wrap_method(cls, "on_processing_start", _make_on_processing_start)
-    _wrap_method(cls, "on_processing_complete", _make_on_processing_complete)
     _wrap_method(cls, "_start_typing_refresh", _make_start_typing_refresh)
     _wrap_method(cls, "send_typing", _make_send_typing)
     _wrap_method(cls, "stop_typing", _make_stop_typing)
@@ -1060,10 +876,10 @@ def _is_slack_adapter_file(path) -> bool:
 
 
 _GATEWAY_PATCHES = {
+    "agent.display": _patch_display,
     "gateway.response_filters": _patch_response_filters,
     "gateway.run_busy": _patch_run_busy,
     "gateway.run_inbound": _patch_run_inbound,
-    "gateway.run_turn": _patch_run_turn,
     "gateway.run_turn_progress": _patch_run_turn_progress,
     "gateway.session": _patch_session,
     "gateway.session_ingress": _patch_session_ingress,
