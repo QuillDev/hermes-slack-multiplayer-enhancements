@@ -516,7 +516,8 @@ def _make_task_card_publish(original):
         cancelling = bool(task and task.cancelling())
         cancelled = None
         if last is not None and not cancelling:
-            wait = last + _CARD_MIN_INTERVAL - time.monotonic()
+            flat_dm = str(self._ctx.source.chat_id or "").startswith("D")
+            wait = last + (_DM_CARD_MIN_INTERVAL if flat_dm else _CARD_MIN_INTERVAL) - time.monotonic()
             if wait > 0:
                 try:
                     await asyncio.sleep(wait)
@@ -623,6 +624,10 @@ def _make_native_task_card_key(original):
 def _make_send_native_task_card_progress(original):
     async def send_native_task_card_progress(self, chat_id, tasks, *, title=None, reply_to=None,
                                              metadata=None, fallback_text=None):
+        if self._native_task_card_key(chat_id, reply_to, metadata) is None:
+            card = _dm_card(self, chat_id, metadata)
+            if card is not None:
+                return await _update_dm_card(self, card, tasks)
         result = await original(self, chat_id, tasks, title=_PLAN_TITLE, reply_to=reply_to,
                                 metadata=metadata, fallback_text=fallback_text)
         stamp = getattr(result, "message_id", None) if getattr(result, "success", False) else None
@@ -635,6 +640,123 @@ def _make_send_native_task_card_progress(original):
         return result
     send_native_task_card_progress.__wrapped__ = original
     return send_native_task_card_progress
+
+
+# A top-level DM can't hold a thread card without opening a thread under the user's message, so
+# it gets a flat card instead: a plain message with a plan block, posted when the eyes go on,
+# edited as tools run and deleted once the turn is over (after the answer has landed).
+_DM_CARDS_ATTR = "_sme_dm_cards"
+_DM_CARD_MIN_INTERVAL = 1.5  # chat.update is Tier 3 (~50/min)
+_DM_CARD_START = {"id": "sme_thinking", "title": "thinking", "status": "in_progress"}
+_DM_CARD_MAX_TASKS = 50  # Slack's plan block limit
+
+
+def _dm_plan(card):
+    tasks = list(card["tasks"].values())[-_DM_CARD_MAX_TASKS:] or [_DM_CARD_START]
+    return [{"type": "plan", "title": _PLAN_TITLE,
+             "tasks": [{"task_id": t["id"], "title": t["title"], "status": t["status"]} for t in tasks]}]
+
+
+def _dm_card(adapter, chat_id, metadata):
+    anchor = (metadata or {}).get(_CARD_ANCHOR)
+    return adapter.__dict__.get(_DM_CARDS_ATTR, {}).get((str(chat_id), str(anchor))) if anchor else None
+
+
+def _wants_dm_card(adapter, event) -> bool:
+    source = getattr(event, "source", None)
+    chat_id = str(getattr(source, "chat_id", "") or "")
+    message_id = getattr(event, "message_id", None)
+    thread_id = getattr(source, "thread_id", None)
+    kind = getattr(getattr(event, "message_type", None), "name", "")
+    return (chat_id.startswith("D") and bool(message_id) and kind != "COMMAND"
+            and (not thread_id or str(thread_id) == str(message_id))
+            and not adapter.config.extra.get("reply_in_thread", True)
+            and adapter.native_task_cards_enabled())
+
+
+def _make_on_processing_start(original):
+    import asyncio
+
+    async def on_processing_start(self, event):
+        await original(self, event)
+        try:
+            if not _wants_dm_card(self, event):
+                return
+            chat_id, team_id = str(event.source.chat_id), str(getattr(event.source, "scope_id", "") or "")
+            card = {"chat": chat_id, "team": team_id, "ts": None, "tasks": {}, "lock": asyncio.Lock()}
+            resp = await self._get_client(chat_id, team_id=team_id).api_call(
+                "chat.postMessage", json={"channel": chat_id, "text": _PLAN_TITLE, "blocks": _dm_plan(card)})
+            card["ts"] = str(resp["ts"])
+            self.__dict__.setdefault(_DM_CARDS_ATTR, {})[(chat_id, str(event.message_id))] = card
+        except Exception as exc:
+            logger.warning("slack-multiplayer-enhancements: couldn't post the DM plan card: %s", exc)
+    on_processing_start.__wrapped__ = original
+    return on_processing_start
+
+
+def _make_on_processing_complete(original):
+    async def on_processing_complete(self, event, outcome):
+        try:
+            return await original(self, event, outcome)
+        finally:
+            key = (str(getattr(event.source, "chat_id", "")), str(getattr(event, "message_id", "")))
+            card = self.__dict__.get(_DM_CARDS_ATTR, {}).pop(key, None)
+            if card is not None:
+                async with card["lock"]:
+                    card["ts"], ts = None, card["ts"]
+                    try:
+                        await self._get_client(card["chat"], team_id=card["team"]).api_call(
+                            "chat.delete", json={"channel": card["chat"], "ts": ts})
+                    except Exception as exc:
+                        logger.warning("slack-multiplayer-enhancements: couldn't delete the DM plan card: %s", exc)
+    on_processing_complete.__wrapped__ = original
+    return on_processing_complete
+
+
+async def _update_dm_card(adapter, card, tasks):
+    from gateway.platforms.base import SendResult
+    async with card["lock"]:
+        if not card["ts"]:
+            return SendResult(success=False, error="Progress stream already stopped")
+        for task in tasks:
+            card["tasks"][task["id"]] = {"id": task["id"], "title": task["title"], "status": task["status"]}
+        try:
+            await adapter._get_client(card["chat"], team_id=card["team"]).api_call(
+                "chat.update", json={"channel": card["chat"], "ts": card["ts"], "text": _PLAN_TITLE,
+                                     "blocks": _dm_plan(card)})
+        except Exception as exc:
+            return SendResult(success=False, error=str(exc))
+        return SendResult(success=True, message_id=card["ts"])
+
+
+def _make_native_task_card_destination_supported(original):
+    def native_task_card_destination_supported(self, chat_id, *, reply_to=None, metadata=None):
+        if self._native_task_card_key(chat_id, reply_to, metadata) is None and \
+                _dm_card(self, chat_id, metadata) is not None:
+            return True
+        return original(self, chat_id, reply_to=reply_to, metadata=metadata)
+    native_task_card_destination_supported.__wrapped__ = original
+    return native_task_card_destination_supported
+
+
+def _make_session_status_method(original):
+    # Core sends its free-text "is thinking..." status, which only assistant.threads.setStatus
+    # takes; agents.sessions.setStatus (picked when the SDK has it) wants an enum and refuses
+    # every call, so a thread never showed the status.
+    def _session_status_method(client):
+        legacy = getattr(client, "assistant_threads_setStatus", None)
+        return legacy if legacy is not None else original(client)
+    _session_status_method.__wrapped__ = original
+    return _session_status_method
+
+
+def _patch_adapter_module(module) -> None:
+    original = getattr(module, "_session_status_method", None)
+    if original is None:
+        logger.error("slack-multiplayer-enhancements: _session_status_method is gone; the thread status patch is off")
+        return
+    if getattr(original, "__wrapped__", None) is None:
+        module._session_status_method = _make_session_status_method(original)
 
 
 def _make_run_agent_progress_threading(original):
@@ -699,6 +821,9 @@ def _patch_adapter_class(cls) -> bool:
     _wrap_method(cls, "_thread_context_line", _make_thread_context_line)
     _wrap_method(cls, "_native_task_card_key", _make_native_task_card_key)
     _wrap_method(cls, "send_native_task_card_progress", _make_send_native_task_card_progress)
+    _wrap_method(cls, "native_task_card_destination_supported", _make_native_task_card_destination_supported)
+    _wrap_method(cls, "on_processing_start", _make_on_processing_start)
+    _wrap_method(cls, "on_processing_complete", _make_on_processing_complete)
     setattr(cls, _PATCHED_FLAG, True)
     return True
 
@@ -749,6 +874,7 @@ def _patch_module(module) -> None:
         _GATEWAY_PATCHES[name](module)
     elif _is_slack_adapter_file(getattr(module, "__file__", None)):
         _patch_adapter_class(getattr(module, "SlackAdapter", None))
+        _patch_adapter_module(module)
 
 
 class _SlackAdapterPatchFinder(importlib.abc.MetaPathFinder):
