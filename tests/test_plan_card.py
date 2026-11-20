@@ -353,6 +353,8 @@ async def test_every_step_of_a_turn_stays_on_the_card_in_order(monkeypatch, tmp_
 
     assert _left(fake) == [[("thinking", "complete"), ("running a command", "complete"), ("thinking", "complete"),
                             ("reading files", "complete"), ("thinking", "complete")], StepsAgent.final]
+    # Every edit keeps the card's one block id, so a card someone opened stays open.
+    assert len({plan.get("block_id") for plan in fake.plan_frames()} - {None}) == 1
 
 
 @pytest.mark.asyncio
