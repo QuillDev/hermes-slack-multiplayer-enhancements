@@ -46,6 +46,7 @@ from gateway.session import SessionSource  # noqa: E402
 from plugins.platforms.slack.adapter import SlackAdapter  # noqa: E402
 
 CHANNEL = "C0000000001"
+DM = "D0000000001"
 MESSAGE_TS = "1700000000.000100"
 CARD_TS = "1700000000.000200"
 SECRET_ARG = "select * from vault where token = 'xoxb-NOT-A-REAL-TOKEN'"
@@ -64,6 +65,7 @@ class FakeSlack:
         self.fail = set(fail)
         self.calls = []
         self.messages = {}  # ts -> {"thread_ts", "chunks", "streaming", "text"}
+        self.status_shown = {}  # thread ts -> every status it showed ("" = cleared)
         self._seq = 0
 
     async def handle(self, request):
@@ -93,7 +95,21 @@ class FakeSlack:
             self._seq += 1
             ts = f"1700000001.{self._seq:06d}"
             self.messages[ts] = {"thread_ts": body.get("thread_ts"), "text": body.get("text"), "streaming": False}
+            if body.get("blocks"):
+                self.messages[ts]["blocks"] = body["blocks"]
             return aiohttp_web.json_response({"ok": True, "channel": CHANNEL, "ts": ts})
+        if method == "agents.sessions.setStatus" and body.get("status") not in {
+                "processing", "active", "suspended", "closed"}:
+            return aiohttp_web.json_response({"ok": False, "error": "invalid_arguments"})
+        if method in {"assistant.threads.setStatus", "agents.sessions.setStatus"}:
+            self.status_shown.setdefault(body.get("thread_ts"), []).append(body.get("status"))
+            return aiohttp_web.json_response({"ok": True})
+        if method == "chat.update":
+            msg = self.messages.get(body.get("ts"))
+            if not msg:
+                return aiohttp_web.json_response({"ok": False, "error": "message_not_found"})
+            msg["blocks"] = body.get("blocks")
+            return aiohttp_web.json_response({"ok": True, "channel": CHANNEL, "ts": body["ts"]})
         return aiohttp_web.json_response({"ok": True})
 
     def card(self):
@@ -107,6 +123,20 @@ class FakeSlack:
                 seq = states.setdefault(chunk["id"], [])
                 if not seq or seq[-1] != chunk["status"]:
                     seq.append(chunk["status"])
+        return states
+
+    def plan_frames(self):
+        """Every plan block a flat card showed, in order: as posted, then each edit."""
+        return [block for method, body in self.calls if method in {"chat.postMessage", "chat.update"}
+                for block in body.get("blocks") or [] if block.get("type") == "plan"]
+
+    def flat_task_states(self):
+        states = {}
+        for plan in self.plan_frames():
+            for task in plan["tasks"]:
+                seq = states.setdefault(task["task_id"], [])
+                if not seq or seq[-1] != task["status"]:
+                    seq.append(task["status"])
         return states
 
     def wire_text(self):
@@ -193,7 +223,7 @@ def _make_runner(adapter):
     return runner
 
 
-async def _turn(monkeypatch, tmp_path, fake, agent_cls, *, cards=True):
+async def _turn(monkeypatch, tmp_path, fake, agent_cls, *, cards=True, dm=False):
     fake_dotenv = types.ModuleType("dotenv")
     fake_dotenv.load_dotenv = lambda *args, **kwargs: None
     monkeypatch.setitem(sys.modules, "dotenv", fake_dotenv)
@@ -210,12 +240,31 @@ async def _turn(monkeypatch, tmp_path, fake, agent_cls, *, cards=True):
     gateway_run = importlib.import_module("gateway.run")
     monkeypatch.setattr(gateway_run, "_hermes_home", tmp_path)
     monkeypatch.setattr(gateway_run, "_resolve_runtime_agent_kwargs", lambda: {"api_key": "***"})
-    # A top-level channel message: inbound sets thread_id to the message's own ts.
-    source = SessionSource(platform=Platform.SLACK, chat_id=CHANNEL, chat_type="group",
-                           thread_id=MESSAGE_TS, user_id="U0000000001", scope_id="T0000000001")
-    return await runner._run_agent(
+    if not dm:
+        # A top-level channel message: inbound sets thread_id to the message's own ts.
+        source = SessionSource(platform=Platform.SLACK, chat_id=CHANNEL, chat_type="group",
+                               thread_id=MESSAGE_TS, user_id="U0000000001", scope_id="T0000000001")
+        return await runner._run_agent(
+            message="hello", context_prompt="", history=[], source=source, session_id="sess-card",
+            session_key=f"agent:main:slack:group:{CHANNEL}:{MESSAGE_TS}", event_message_id=MESSAGE_TS)
+    # A top-level DM, one session per DM: inbound leaves thread_id unset. Driven through the
+    # processing hooks and final send in the order the gateway's message handler runs them.
+    from gateway.platforms.base import _thread_metadata_for_source
+    from gateway.platforms.event import MessageEvent, ProcessingOutcome
+    from gateway.response_filters import is_intentional_silence_agent_result
+    adapter.config.extra["dm_top_level_threads_as_sessions"] = False
+    source = SessionSource(platform=Platform.SLACK, chat_id=DM, chat_type="dm",
+                           user_id="U0000000001", scope_id="T0000000001")
+    event = MessageEvent(text="hello", source=source, message_id=MESSAGE_TS)
+    await adapter.on_processing_start(event)
+    result = await runner._run_agent(
         message="hello", context_prompt="", history=[], source=source, session_id="sess-card",
-        session_key=f"agent:main:slack:group:{CHANNEL}:{MESSAGE_TS}", event_message_id=MESSAGE_TS)
+        session_key=f"agent:main:slack:dm:{DM}", event_message_id=MESSAGE_TS)
+    if not is_intentional_silence_agent_result(result, result.get("final_response")):
+        await adapter.send(DM, result["final_response"], reply_to=MESSAGE_TS,
+                           metadata=_thread_metadata_for_source(source, MESSAGE_TS))
+    await adapter.on_processing_complete(event, ProcessingOutcome.SUCCESS)
+    return result
 
 
 @pytest.mark.asyncio
@@ -239,13 +288,71 @@ async def test_tool_turn_shows_a_plan_in_the_message_thread_then_answers_once(mo
 
 
 @pytest.mark.asyncio
-async def test_failing_tool_puts_no_args_names_or_error_text_on_the_wire(monkeypatch, tmp_path, slack):
+async def test_dm_turn_shows_a_flat_plan_then_leaves_only_the_answer(monkeypatch, tmp_path, slack):
     fake = await slack()
 
-    await _turn(monkeypatch, tmp_path, fake, ToolAgent)
+    result = await _turn(monkeypatch, tmp_path, fake, ToolAgent, dm=True)
+
+    plans = fake.plan_frames()
+    assert plans and {plan["title"] for plan in plans} == {"working on it"}
+    assert [t["title"] for t in plans[0]["tasks"]] == ["thinking"]  # up before any tool ran
+    states = fake.flat_task_states()
+    # Shown running, then ended with its result (the DM pace may fold a short step's frames).
+    assert states["call-1"] == ["in_progress", "complete"] and states["call-2"][-1] == "error"
+    assert {t["title"] for t in plans[-1]["tasks"]} == {"checking slack", "running a query"}
+    # No threads anywhere in the DM, and the answer is the one message left.
+    assert not any(body.get("thread_ts") for _, body in fake.calls)
+    assert "chat.startStream" not in [m for m, _ in fake.calls]
+    assert list(fake.messages.values()) == [
+        {"thread_ts": None, "text": result["final_response"], "streaming": False}]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("agent_cls", [NoToolAgent, SilentToolAgent], ids=["no-tools", "no-reply"])
+async def test_dm_card_goes_away_on_chat_and_silent_turns(monkeypatch, tmp_path, slack, agent_cls):
+    fake = await slack()
+
+    result = await _turn(monkeypatch, tmp_path, fake, agent_cls, dm=True)
+
+    assert fake.plan_frames()  # the card was up while the turn ran
+    left = [m["text"] for m in fake.messages.values()]
+    assert left == ([] if agent_cls is SilentToolAgent else [result["final_response"]])
+
+
+@pytest.mark.asyncio
+async def test_thread_turns_show_the_responding_status_and_top_level_dms_do_not(slack):
+    from gateway.platforms.base import _thread_metadata_for_source
+    from gateway.platforms.helpers import typing_metadata_for_turn
+    fake = await slack()
+    adapter = SlackAdapter(PlatformConfig(enabled=True, token="xoxb-test", extra={
+        "reply_in_thread": False, "dm_top_level_threads_as_sessions": False}))
+    adapter._app = SimpleNamespace(client=fake.client)
+    root = "1700000000.000050"
+    cases = {(CHANNEL, root): "group", (DM, root): "dm", (DM, None): "dm"}
+
+    for (chat, thread), chat_type in cases.items():
+        source = SessionSource(platform=Platform.SLACK, chat_id=chat, chat_type=chat_type, thread_id=thread,
+                               user_id="U0000000001", scope_id="T0000000001")
+        # The turn's status metadata, as the gateway fixes it when the eyes go on.
+        metadata = typing_metadata_for_turn(adapter, chat, MESSAGE_TS, _thread_metadata_for_source(source, MESSAGE_TS))
+        await adapter.send_typing(chat, metadata=metadata)
+        await adapter.stop_typing(chat, metadata=metadata)
+
+    # Shown, then cleared, on the thread (channel and DM); never on a top-level DM message.
+    assert fake.status_shown == {root: ["is thinking...", "", "is thinking...", ""]}
+    assert fake.messages == {}
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("dm", [False, True], ids=["channel", "dm"])
+async def test_failing_tool_puts_no_args_names_or_error_text_on_the_wire(monkeypatch, tmp_path, slack, dm):
+    fake = await slack()
+
+    await _turn(monkeypatch, tmp_path, fake, ToolAgent, dm=dm)
 
     wire = fake.wire_text()
-    assert "error" in json.dumps(fake.task_states())  # the failure did reach the card
+    states = fake.flat_task_states() if dm else fake.task_states()
+    assert "error" in json.dumps(states)  # the failure did reach the card
     for leaked in (SECRET_ARG, "xoxb-NOT-A-REAL-TOKEN", SECRET_ERROR, "vault",
                    "query_snowflake", "conversations_history", CHANNEL + "\"}"):
         assert leaked not in wire
