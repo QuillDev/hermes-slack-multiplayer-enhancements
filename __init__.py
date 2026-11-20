@@ -665,7 +665,7 @@ def _make_send_native_task_card_progress(original):
 
 
 # The bot never opens a thread itself, so a top-level message (channel or DM) gets a flat card: a
-# plain message with a plan block, posted when the eyes go on and edited as tools run. When the
+# plain message with a plan block, posted when the turn starts and edited as tools run. When the
 # answer lands the card stays above it with its steps finished; a silent turn deletes it. A message
 # already in a thread keeps core's in-thread card.
 _FLAT_CARDS_ATTR = "_sme_flat_cards"
@@ -701,7 +701,7 @@ def _wants_flat_card(adapter, event) -> bool:
     reacting = getattr(adapter, "_reacting_target", None)
     return (bool(getattr(source, "chat_id", None)) and bool(message_id) and kind != "COMMAND"
             and (not thread_id or str(thread_id) == str(message_id))
-            and callable(reacting) and reacting(event) is not None  # the card goes up with the eyes
+            and callable(reacting) and reacting(event) is not None  # only messages the bot takes up
             and not adapter.config.extra.get("reply_in_thread", True)
             and adapter.native_task_cards_enabled())
 
@@ -728,7 +728,7 @@ def _make_on_processing_start(original):
     import asyncio
 
     async def on_processing_start(self, event):
-        await original(self, event)
+        # No eyes reaction: the "is working" status under the message shows the turn instead.
         try:
             if not _wants_flat_card(self, event):
                 return
@@ -828,6 +828,19 @@ def _make_native_task_card_destination_supported(original):
     return native_task_card_destination_supported
 
 
+def _status_metadata_for_turn(self, chat_id, anchor, metadata):
+    """Core's turn-status hook: with flat replies a top-level message names no thread, so core
+    showed no status for it. Slack shows a status set on the message's own ts right under it,
+    without opening a thread, so a message that would have got the eyes gets it there."""
+    md = dict(metadata or {})
+    if md.get("thread_id") or md.get("thread_ts") or self.config.extra.get("reply_in_thread", True):
+        return md
+    marker = self._workspace_message_marker(str(md.get("slack_team_id") or ""), str(anchor))
+    if marker in self._reacting_message_ids:
+        md["thread_id"] = str(anchor)
+    return md
+
+
 def _make_session_status_method(original):
     # Core sends its free-text "is thinking..." status, which only assistant.threads.setStatus
     # takes; agents.sessions.setStatus (picked when the SDK has it) wants an enum and refuses
@@ -903,6 +916,7 @@ def _patch_adapter_class(cls) -> bool:
     if cls is None or getattr(cls, _PATCHED_FLAG, False):
         return False
     cls._humanize_user_mentions = _humanize_user_mentions
+    cls.status_metadata_for_turn = _status_metadata_for_turn
     _wrap_method(cls, "_apply_bot_mention", _make_apply_bot_mention)
     _wrap_method(cls, "_build_identity_prompt", _make_build_identity_prompt)
     _wrap_method(cls, "_handle_slack_message", _make_handle_slack_message)

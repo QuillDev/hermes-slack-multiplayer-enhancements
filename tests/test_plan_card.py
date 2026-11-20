@@ -75,7 +75,10 @@ class FakeSlack:
 
     async def handle(self, request):
         method = request.match_info["method"]
-        body = await request.json() if request.can_read_body else {}
+        if request.content_type == "application/json":
+            body = await request.json()
+        else:  # the SDK sends some calls (reactions) as query params
+            body = {**request.query, **await request.post()}
         self.calls.append((method, body))
         self.call_times.append((method, time.monotonic()))
         if method in self.fail_once:
@@ -441,26 +444,42 @@ async def test_thread_turn_shows_a_plan_in_its_thread_then_answers_there(monkeyp
 
 
 @pytest.mark.asyncio
-async def test_thread_turns_show_the_responding_status_and_top_level_dms_do_not(slack):
+async def test_status_shows_on_threads_and_on_addressed_top_level_messages(slack):
     from gateway.platforms.base import _thread_metadata_for_source
     from gateway.platforms.helpers import typing_metadata_for_turn
     fake = await slack()
     adapter = SlackAdapter(PlatformConfig(enabled=True, token="xoxb-test", extra={
         "reply_in_thread": False, "dm_top_level_threads_as_sessions": False}))
     adapter._app = SimpleNamespace(client=fake.client)
-    cases = {(CHANNEL, ROOT_TS): "group", (DM, ROOT_TS): "dm", (DM, None): "dm", (CHANNEL, None): "group"}
+    addressed_ts, unaddressed_ts = "1700000000.000101", "1700000000.000102"
+    adapter._track_reacting_message("T0000000001", addressed_ts)  # a DM or a message that tags the bot
+    cases = [(CHANNEL, ROOT_TS, "group", MESSAGE_TS), (DM, ROOT_TS, "dm", MESSAGE_TS),
+             (DM, None, "dm", addressed_ts), (CHANNEL, None, "group", unaddressed_ts)]
 
-    for (chat, thread), chat_type in cases.items():
+    for chat, thread, chat_type, message_ts in cases:
         source = SessionSource(platform=Platform.SLACK, chat_id=chat, chat_type=chat_type, thread_id=thread,
                                user_id="U0000000001", scope_id="T0000000001")
-        # The turn's status metadata, as the gateway fixes it when the eyes go on.
-        metadata = typing_metadata_for_turn(adapter, chat, MESSAGE_TS, _thread_metadata_for_source(source, MESSAGE_TS))
+        # The turn's status metadata, as the gateway fixes it when the turn starts.
+        metadata = typing_metadata_for_turn(adapter, chat, message_ts, _thread_metadata_for_source(source, message_ts))
         await adapter.send_typing(chat, metadata=metadata)
         await adapter.stop_typing(chat, metadata=metadata)
 
-    # Shown, then cleared, on the thread (channel and DM); never on a top-level message.
-    assert fake.status_shown == {ROOT_TS: ["is thinking...", "", "is thinking...", ""]}
+    # Shown, then cleared: on the thread (channel and DM), and right under an addressed top-level
+    # message; never under a channel message the bot only overheard.
+    assert fake.status_shown == {ROOT_TS: ["is thinking...", "", "is thinking...", ""],
+                                 addressed_ts: ["is thinking...", ""]}
     assert fake.messages == {}
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("where", ["thread", "channel", "dm"])
+async def test_a_turn_puts_no_eyes_on_the_message(monkeypatch, tmp_path, slack, where):
+    fake = await slack()
+
+    await _turn(monkeypatch, tmp_path, fake, ToolAgent, where=where)
+
+    added = [body.get("name") for method, body in fake.calls if method == "reactions.add"]
+    assert "eyes" not in added and added == ["white_check_mark"]
 
 
 @pytest.mark.asyncio
