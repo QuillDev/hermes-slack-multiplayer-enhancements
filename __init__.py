@@ -80,6 +80,14 @@
    don't. A turn that ends silent (NO_REPLY) deletes its card, and a streaming error stays
    quiet instead of posting core's text progress fallback, unless ``tool_progress`` was set.
 
+10. An edit to an old Slack message never posts "already received a different message".
+
+   Slack sends an edit as the original message with new text. Core skips edits of messages it
+   already handled, but only from an in-memory list that a gateway restart empties. An edit
+   that lands after a restart then reaches admission under the original's id with other text,
+   and core refuses it and posts a warning to the channel. The earlier message already ran, so
+   on Slack that refusal now stays silent (gateway.log still records it).
+
 All of this patches private Hermes internals. When upstream renames one, the matching patch
 logs an error and that piece falls back to stock behavior. The gateway and the Slack adapter
 are often imported after this plugin registers, so patches apply to already-imported modules
@@ -933,6 +941,39 @@ def _patch_run_busy(module) -> None:
     setattr(cls, _PATCHED_FLAG, True)
 
 
+# ----- edit of an admitted message --------------------------------------------
+
+
+def _is_slack_event(event) -> bool:
+    platform = getattr(getattr(event, "source", None), "platform", None)
+    return str(getattr(platform, "value", platform) or "").lower() == "slack"
+
+
+def _make_admit_message(original, module):
+    async def admit_message(authority, event):
+        reply = await original(authority, event)
+        if reply is not None and reply == getattr(module, "ALREADY_ADMITTED_REPLY", None) \
+                and _is_slack_event(event):
+            logger.info("slack-multiplayer-enhancements: dropped an edit of already-admitted Slack "
+                        "message %s quietly", getattr(event, "message_id", None))
+            return None
+        return reply
+    setattr(admit_message, "__wrapped__", original)
+    setattr(admit_message, "_sme_patched", True)
+    return admit_message
+
+
+def _patch_session_ingress(module) -> None:
+    original = getattr(module, "admit_message", None)
+    if original is None or not hasattr(module, "ALREADY_ADMITTED_REPLY"):
+        logger.error("slack-multiplayer-enhancements: admit_message or ALREADY_ADMITTED_REPLY is gone; "
+                     "the edit-conflict patch is off")
+        return
+    if getattr(original, "_sme_patched", False):
+        return
+    module.admit_message = _make_admit_message(original, module)
+
+
 def _is_slack_adapter_file(path) -> bool:
     return bool(path) and os.path.normpath(str(path)).endswith(_ADAPTER_SUFFIX)
 
@@ -944,6 +985,7 @@ _GATEWAY_PATCHES = {
     "gateway.run_turn": _patch_run_turn,
     "gateway.run_turn_progress": _patch_run_turn_progress,
     "gateway.session": _patch_session,
+    "gateway.session_ingress": _patch_session_ingress,
     "hermes_cli.goals": _patch_goals,
 }
 
