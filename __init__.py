@@ -68,6 +68,18 @@
    owner's private messages back. The Slack platform notes now name this chat's channel id
    (and a real thread's ts) and say the home channel is a different chat.
 
+9. Slack plan card: live tool progress that says nothing it shouldn't.
+
+   With core's ``platforms.slack.extra.native_task_cards`` on, a tool-using turn shows a
+   Slack plan block in the message's thread. This plugin titles it "working on it", names each
+   task by its kind ("checking slack", "running a query") instead of the tool name and its
+   arguments, and marks a failed call as an error with no error text. Frames go out at most
+   once a second, folding bursts together, and a task that finished after scrolling out of the
+   card's last-eight window still gets its final state. With flat replies
+   (``reply_in_thread: false``) a top-level channel message gets a thread for the card; DMs
+   don't. A turn that ends silent (NO_REPLY) deletes its card, and a streaming error stays
+   quiet instead of posting core's text progress fallback, unless ``tool_progress`` was set.
+
 All of this patches private Hermes internals. When upstream renames one, the matching patch
 logs an error and that piece falls back to stock behavior. The gateway and the Slack adapter
 are often imported after this plugin registers, so patches apply to already-imported modules
@@ -452,6 +464,218 @@ def _patch_run_inbound(module) -> None:
     setattr(cls, _PATCHED_FLAG, True)
 
 
+# ----- Slack plan card ----------------------------------------------------------------
+
+_PLAN_TITLE = "working on it"
+# Slack allows chat.appendStream at Tier 4 (100+/min); one frame a second stays well under it.
+_CARD_MIN_INTERVAL = 1.0
+_CARD_TS_ATTR = "_sme_card_ts"
+_CARD_ANCHOR = "sme_card_anchor_ts"
+_CARD_LABELS = (
+    (("send_message",), "sending a message"),
+    (("slack",), "checking slack"),
+    (("web_search", "search_web"), "searching the web"),
+    (("web_extract", "browser", "browse", "fetch"), "reading a web page"),
+    (("query", "sql", "snowflake", "autopat", "sigma"), "running a query"),
+    (("terminal", "execute_code", "process", "shell"), "running a command"),
+    (("write_file", "patch", "edit"), "editing files"),
+    (("read_file", "search_files", "file"), "reading files"),
+    (("session_search",), "looking through past chats"),
+    (("skill", "memory"), "checking notes"),
+    (("vision", "image"), "looking at an image"),
+)
+
+
+def _card_label(tool_name) -> str:
+    """A short plain label for a tool's kind: never its name, arguments or results."""
+    name = str(tool_name or "").lower()
+    for needles, label in _CARD_LABELS:
+        if any(n in name for n in needles):
+            return label
+    return "using a tool"
+
+
+def _make_apply_event(original):
+    def apply_event(self, raw):
+        if isinstance(raw, dict) and raw.get("type") in {"tool.started", "tool.completed"}:
+            raw = {"type": raw["type"], "tool_call_id": raw.get("tool_call_id"),
+                   "tool_name": _card_label(raw.get("tool_name")), "is_error": raw.get("is_error")}
+        return original(self, raw)
+    apply_event.__wrapped__ = original
+    return apply_event
+
+
+def _make_task_card_publish(original):
+    import asyncio
+
+    async def _task_card_publish(self, st):
+        # Coalesce: wait out the interval, then fold every queued event into one frame (each
+        # frame carries the whole task list). The turn-end flush runs while cancelling: no wait.
+        last = getattr(st, "_sme_last_publish", None)
+        task = asyncio.current_task()
+        cancelling = bool(task and task.cancelling())
+        cancelled = None
+        if last is not None and not cancelling:
+            wait = last + _CARD_MIN_INTERVAL - time.monotonic()
+            if wait > 0:
+                try:
+                    await asyncio.sleep(wait)
+                except asyncio.CancelledError as exc:
+                    # The turn ended mid-wait. This frame's events are already out of the
+                    # queue, so core's own last flush won't see them: send them now.
+                    cancelled = exc
+                self._task_card_drain(st)
+                if cancelled is not None and not (
+                        self._ctx._run_still_current() and not self._agent_interrupted()):
+                    raise cancelled
+        st._sme_last_publish = time.monotonic()
+        # Core shows the last 8 tasks. A task that finished between frames and already scrolled
+        # out would keep its spinner forever, so send its final state once too.
+        published = st.__dict__.setdefault("_sme_published", {})
+        window = type(st).visible_tasks(st)
+        shown = {task["id"] for task in window}
+        settled = [st.tasks[i] for i in st.task_order
+                   if i not in shown and published.get(i) != st.tasks[i]["status"]]
+        frame = settled + window
+        st.visible_tasks = lambda: frame
+        try:
+            result = await original(self, st)
+        finally:
+            del st.visible_tasks
+            published.update({task["id"]: task["status"] for task in frame})
+        if cancelled is not None:
+            raise cancelled
+        return result
+    _task_card_publish.__wrapped__ = original
+    return _task_card_publish
+
+
+def _make_task_card_fallback(original):
+    async def _task_card_send_or_edit_fallback(self, st):
+        # Core turns a failed card into a text progress bubble. Without an operator-written
+        # tool_progress mode that is new chatter in the channel, so stay quiet instead.
+        if not getattr(self._ctx, "tool_progress_enabled", False):
+            return None
+        return await original(self, st)
+    _task_card_send_or_edit_fallback.__wrapped__ = original
+    return _task_card_send_or_edit_fallback
+
+
+def _turn_was_silent(ctx) -> bool:
+    try:
+        from gateway.response_filters import is_intentional_silence_agent_result
+        result = (getattr(ctx, "result_holder", None) or [None])[0]
+        if not isinstance(result, dict):
+            return False
+        return bool(is_intentional_silence_agent_result(result, result.get("final_response")))
+    except Exception:
+        logger.exception("slack-multiplayer-enhancements: silent-turn check failed")
+        return False
+
+
+async def _drop_turn_cards(runner, adapter) -> None:
+    """Forget this turn's cards; delete them when the turn ended silent (NO_REPLY)."""
+    ctx = runner._ctx
+    key_fn = getattr(adapter, "_native_task_card_key", None)
+    cards = getattr(adapter, _CARD_TS_ATTR, None)
+    if not callable(key_fn) or not isinstance(cards, dict):
+        return
+    key = key_fn(ctx.source.chat_id, ctx._progress_reply_to, ctx._progress_metadata)
+    stamps = cards.pop(key, [])
+    if not stamps or not _turn_was_silent(ctx):
+        return
+    client = adapter._get_client(key[1], team_id=key[0])
+    for ts in stamps:
+        try:
+            await client.api_call("chat.delete", json={"channel": key[1], "ts": ts})
+        except Exception as exc:
+            logger.warning("slack-multiplayer-enhancements: couldn't delete a silent turn's card: %s", exc)
+
+
+def _make_send_native_task_card_progress_runner(original):
+    async def _send_native_task_card_progress(self, adapter):
+        try:
+            return await original(self, adapter)
+        finally:
+            try:
+                await _drop_turn_cards(self, adapter)
+            except Exception:
+                logger.exception("slack-multiplayer-enhancements: card cleanup failed")
+    _send_native_task_card_progress.__wrapped__ = original
+    return _send_native_task_card_progress
+
+
+def _make_native_task_card_key(original):
+    def _native_task_card_key(self, chat_id, reply_to, metadata):
+        key = original(self, chat_id, reply_to, metadata)
+        if key is not None or str(chat_id or "").startswith("D"):
+            return key
+        # Flat replies (reply_in_thread: false) leave a top-level channel message with no
+        # thread; start one on the message itself so the card has somewhere to live.
+        anchor = (metadata or {}).get(_CARD_ANCHOR)
+        if not anchor:
+            return None
+        return self._workspace_thread_key(self._metadata_team_id(metadata), chat_id, str(anchor))
+    _native_task_card_key.__wrapped__ = original
+    return _native_task_card_key
+
+
+def _make_send_native_task_card_progress(original):
+    async def send_native_task_card_progress(self, chat_id, tasks, *, title=None, reply_to=None,
+                                             metadata=None, fallback_text=None):
+        result = await original(self, chat_id, tasks, title=_PLAN_TITLE, reply_to=reply_to,
+                                metadata=metadata, fallback_text=fallback_text)
+        stamp = getattr(result, "message_id", None) if getattr(result, "success", False) else None
+        if stamp:
+            key = self._native_task_card_key(chat_id, reply_to, metadata)
+            cards = self.__dict__.setdefault(_CARD_TS_ATTR, {})
+            seen = cards.setdefault(key, [])
+            if stamp not in seen:
+                seen.append(stamp)
+        return result
+    send_native_task_card_progress.__wrapped__ = original
+    return send_native_task_card_progress
+
+
+def _make_run_agent_progress_threading(original):
+    def _run_agent_progress_threading(self, source, event_message_id, native_slack_task_cards):
+        metadata, reply_to, status_metadata = original(
+            self, source, event_message_id, native_slack_task_cards)
+        if native_slack_task_cards and event_message_id:
+            # Core drops a top-level message's own ts when replies are flat; keep it for the card.
+            metadata = dict(metadata or {})
+            metadata.setdefault(_CARD_ANCHOR, str(event_message_id))
+        return metadata, reply_to, status_metadata
+    _run_agent_progress_threading.__wrapped__ = original
+    return _run_agent_progress_threading
+
+
+def _patch_run_turn(module) -> None:
+    cls = getattr(module, "GatewayTurnMixin", None)
+    if cls is None:
+        logger.error("slack-multiplayer-enhancements: GatewayTurnMixin is gone; the plan card anchor is off")
+        return
+    if getattr(cls, _PATCHED_FLAG, False):
+        return
+    _wrap_method(cls, "_run_agent_progress_threading", _make_run_agent_progress_threading)
+    setattr(cls, _PATCHED_FLAG, True)
+
+
+def _patch_run_turn_progress(module) -> None:
+    cls = getattr(module, "GatewayTurnProgressMixin", None)
+    state = getattr(cls, "_TaskCardState", None)
+    if cls is None or state is None:
+        logger.error("slack-multiplayer-enhancements: the task-card rail is gone; the plan card patch is off")
+        return
+    if getattr(cls, _PATCHED_FLAG, False):
+        return
+    _wrap_method(state, "apply_event", _make_apply_event)
+    _wrap_method(cls, "_task_card_publish", _make_task_card_publish)
+    _wrap_method(cls, "_task_card_send_or_edit_fallback", _make_task_card_fallback)
+    _wrap_method(cls, "_send_native_task_card_progress", _make_send_native_task_card_progress_runner)
+    setattr(cls, _PATCHED_FLAG, True)
+
+
 # ----- applying patches -------------------------------------------------------------
 
 
@@ -473,6 +697,8 @@ def _patch_adapter_class(cls) -> bool:
     _wrap_method(cls, "_handle_slack_message", _make_handle_slack_message)
     _wrap_method(cls, "_should_wake_on_unmentioned_message", _make_should_wake)
     _wrap_method(cls, "_thread_context_line", _make_thread_context_line)
+    _wrap_method(cls, "_native_task_card_key", _make_native_task_card_key)
+    _wrap_method(cls, "send_native_task_card_progress", _make_send_native_task_card_progress)
     setattr(cls, _PATCHED_FLAG, True)
     return True
 
@@ -510,6 +736,8 @@ _GATEWAY_PATCHES = {
     "gateway.response_filters": _patch_response_filters,
     "gateway.run_busy": _patch_run_busy,
     "gateway.run_inbound": _patch_run_inbound,
+    "gateway.run_turn": _patch_run_turn,
+    "gateway.run_turn_progress": _patch_run_turn_progress,
     "gateway.session": _patch_session,
     "hermes_cli.goals": _patch_goals,
 }
