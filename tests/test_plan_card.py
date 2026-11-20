@@ -330,10 +330,11 @@ async def test_status_shows_on_threads_and_on_addressed_top_level_messages(slack
         await adapter.send_typing(chat, metadata=metadata)
         await adapter.stop_typing(chat, metadata=metadata)
 
-    # Shown, then cleared: on the thread (channel and DM), and right under an addressed top-level
-    # DM message; never under a top-level channel message, where Slack doesn't draw it.
+    # Shown, then cleared: as text on the thread (channel and DM); as the agent-session state under
+    # an addressed top-level DM message (a text status there pops the thread panel open on
+    # desktop); never under a top-level channel message, where Slack doesn't draw it.
     assert fake.status_shown == {ROOT_TS: ["is thinking...", "", "is thinking...", ""],
-                                 addressed_ts: ["is thinking...", ""]}
+                                 addressed_ts: ["processing", "active"]}
     assert fake.messages == {}
 
 
@@ -509,11 +510,21 @@ async def test_a_tagged_thread_reply_shows_the_status_right_away(monkeypatch, tm
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("where", ["dm", "thread"])
-async def test_the_status_line_names_each_step_plainly(monkeypatch, tmp_path, slack, where):
+async def test_a_top_level_dm_shows_working_then_done_and_no_text(monkeypatch, tmp_path, slack):
     fake = await slack()
 
-    shown = await _status_turn(monkeypatch, tmp_path, fake, SlowToolAgent, tagged=True, where=where)
+    shown = await _status_turn(monkeypatch, tmp_path, fake, SlowToolAgent, tagged=True, where="dm")
+
+    done = shown.index("active")
+    assert done > 0 and set(shown[:done]) == {"processing"} and set(shown[done:]) == {"active"}
+    assert not [m for m, _ in fake.calls if m == "assistant.threads.setStatus"]
+
+
+@pytest.mark.asyncio
+async def test_the_status_line_names_each_step_plainly(monkeypatch, tmp_path, slack):
+    fake = await slack()
+
+    shown = await _status_turn(monkeypatch, tmp_path, fake, SlowToolAgent, tagged=True)
 
     # Thinking, then the running step by its kind, then cleared when the answer lands.
     assert shown[0] == "is thinking..." and "is checking slack…" in shown and shown[-1] == ""

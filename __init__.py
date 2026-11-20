@@ -680,7 +680,31 @@ def _status_metadata_for_turn(self, chat_id, anchor, metadata):
     marker = self._workspace_message_marker(str(md.get("slack_team_id") or ""), str(anchor))
     if marker in self._reacting_message_ids:
         md["thread_id"] = str(anchor)
+        anchors = self.__dict__.setdefault(_SESSION_STATUS_ATTR, {})
+        anchors[(str(chat_id), str(anchor))] = True
+        while len(anchors) > _SESSION_STATUS_MAX:
+            anchors.pop(next(iter(anchors)))
     return md
+
+
+# A text status (assistant.threads.setStatus) on a top-level DM message makes Slack desktop pop
+# that message's thread panel open. The agent-session status shows a working line under it
+# without the panel, but takes only a state, so top-level DM messages get that instead.
+_SESSION_STATUS_ATTR = "_sme_session_status"
+_SESSION_STATUS_MAX = 500
+
+
+def _make_set_thread_status(original):
+    async def _set_thread_status(self, chat_id, team_id, thread_ts, status, fail_label):
+        if (str(chat_id), str(thread_ts)) not in self.__dict__.get(_SESSION_STATUS_ATTR, {}):
+            return await original(self, chat_id, team_id, thread_ts, status, fail_label)
+        try:
+            await self._get_client(chat_id, team_id=team_id).api_call("agents.sessions.setStatus", json={
+                "channel_id": chat_id, "thread_ts": thread_ts, "status": "processing" if status else "active"})
+        except Exception as exc:
+            logger.debug("slack-multiplayer-enhancements: agent session status %s: %s", fail_label, exc)
+    _set_thread_status.__wrapped__ = original
+    return _set_thread_status
 
 
 def _make_session_status_method(original):
@@ -809,6 +833,7 @@ def _patch_adapter_class(cls) -> bool:
     _wrap_method(cls, "send_typing", _make_send_typing)
     _wrap_method(cls, "stop_typing", _make_stop_typing)
     _wrap_method(cls, "set_status_text", _make_set_status_text)
+    _wrap_method(cls, "_set_thread_status", _make_set_thread_status)
     setattr(cls, _PATCHED_FLAG, True)
     return True
 
