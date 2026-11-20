@@ -852,6 +852,69 @@ def _make_session_status_method(original):
     return _session_status_method
 
 
+# A message that doesn't ask the bot (an untagged reply in a busy thread) still runs a turn, and
+# core showed "is working" for it at once, which reads like a reply on the way. Such a turn holds
+# the status back until its first tool starts; one that answers NO_REPLY never shows it.
+_HELD_STATUS_ATTR = "_sme_held_status"
+_HELD_STATUS_MAX = 500
+
+
+def _status_key(chat_id, metadata):
+    md = metadata or {}
+    return str(chat_id), str(md.get("thread_id") or md.get("thread_ts") or "")
+
+
+def _holds_status(event) -> bool:
+    source = getattr(event, "source", None)
+    return getattr(event, "reply_expected", None) is not True and getattr(source, "chat_type", "") != "dm"
+
+
+def _make_start_typing_refresh(original):
+    def _start_typing_refresh(self, event, interrupt_event, metadata):
+        task = original(self, event, interrupt_event, metadata)
+        # A key stays held until its status shows, so the clears after a silent turn send nothing.
+        held = self.__dict__.setdefault(_HELD_STATUS_ATTR, {})
+        key = _status_key(event.source.chat_id, metadata)
+        held.pop(key, None)
+        if task is not None and _holds_status(event):
+            held[key] = True
+            while len(held) > _HELD_STATUS_MAX:
+                held.pop(next(iter(held)))
+        return task
+    _start_typing_refresh.__wrapped__ = original
+    return _start_typing_refresh
+
+
+def _make_send_typing(original):
+    async def send_typing(self, chat_id, metadata=None):
+        if _status_key(chat_id, metadata) in self.__dict__.get(_HELD_STATUS_ATTR, {}):
+            return  # no tool has started yet
+        return await original(self, chat_id, metadata)
+    send_typing.__wrapped__ = original
+    return send_typing
+
+
+def _make_set_status_text(original):
+    def set_status_text(self, chat_id, text):
+        # A tool started: release this chat's held statuses (status text is per chat in core too).
+        if text:
+            held = self.__dict__.get(_HELD_STATUS_ATTR, {})
+            for key in [k for k in held if k[0] == str(chat_id)]:
+                held.pop(key, None)
+        return original(self, chat_id, text)
+    set_status_text.__wrapped__ = original
+    return set_status_text
+
+
+def _make_stop_typing(original):
+    async def stop_typing(self, chat_id, metadata=None):
+        if _status_key(chat_id, metadata) in self.__dict__.get(_HELD_STATUS_ATTR, {}):
+            return  # never shown, nothing to clear
+        return await original(self, chat_id, metadata)
+    stop_typing.__wrapped__ = original
+    return stop_typing
+
+
 def _patch_adapter_module(module) -> None:
     original = getattr(module, "_session_status_method", None)
     if original is None:
@@ -926,6 +989,10 @@ def _patch_adapter_class(cls) -> bool:
     _wrap_method(cls, "native_task_card_destination_supported", _make_native_task_card_destination_supported)
     _wrap_method(cls, "on_processing_start", _make_on_processing_start)
     _wrap_method(cls, "on_processing_complete", _make_on_processing_complete)
+    _wrap_method(cls, "_start_typing_refresh", _make_start_typing_refresh)
+    _wrap_method(cls, "send_typing", _make_send_typing)
+    _wrap_method(cls, "stop_typing", _make_stop_typing)
+    _wrap_method(cls, "set_status_text", _make_set_status_text)
     setattr(cls, _PATCHED_FLAG, True)
     return True
 
