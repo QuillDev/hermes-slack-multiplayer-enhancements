@@ -5,6 +5,7 @@ fake, served over HTTP to a real ``AsyncWebClient``. Run from a hermes-agent che
 dev environment (see README).
 """
 
+import asyncio
 import importlib
 import importlib.util
 import json
@@ -61,9 +62,11 @@ def _isolated_home(tmp_path, monkeypatch):
 class FakeSlack:
     """Slack's Web API over HTTP: keeps the messages a channel would show."""
 
-    def __init__(self, fail=()):
+    def __init__(self, fail=(), fail_once=()):
         self.fail = set(fail)
+        self.fail_once = set(fail_once)
         self.calls = []
+        self.call_times = []
         self.messages = {}  # ts -> {"thread_ts", "chunks", "streaming", "text"}
         self.status_shown = {}  # thread ts -> every status it showed ("" = cleared)
         self._seq = 0
@@ -72,6 +75,10 @@ class FakeSlack:
         method = request.match_info["method"]
         body = await request.json() if request.can_read_body else {}
         self.calls.append((method, body))
+        self.call_times.append((method, time.monotonic()))
+        if method in self.fail_once:
+            self.fail_once.discard(method)
+            return aiohttp_web.json_response({"ok": False, "error": "ratelimited"})
         if method in self.fail:
             return aiohttp_web.json_response({"ok": False, "error": "internal_error"})
         if method == "chat.startStream":
@@ -223,7 +230,17 @@ def _make_runner(adapter):
     return runner
 
 
-async def _turn(monkeypatch, tmp_path, fake, agent_cls, *, cards=True, dm=False):
+ROOT_TS = "1700000000.000050"  # an existing thread the user's message sits in
+
+
+async def _turn(monkeypatch, tmp_path, fake, agent_cls, *, cards=True, where="thread", addressed=True):
+    """One addressed turn, driven in the order the gateway's message handler runs it: the eyes
+    hook, the agent run, the final send, then the completion hook. ``where``: "channel" or "dm"
+    for a top-level message, "thread" for a channel message inside an existing thread."""
+    from gateway.platforms.base import _thread_metadata_for_source
+    from gateway.platforms.event import MessageEvent, ProcessingOutcome
+    from gateway.response_filters import is_intentional_silence_agent_result
+
     fake_dotenv = types.ModuleType("dotenv")
     fake_dotenv.load_dotenv = lambda *args, **kwargs: None
     monkeypatch.setitem(sys.modules, "dotenv", fake_dotenv)
@@ -231,7 +248,7 @@ async def _turn(monkeypatch, tmp_path, fake, agent_cls, *, cards=True, dm=False)
     fake_run_agent.AIAgent = agent_cls
     monkeypatch.setitem(sys.modules, "run_agent", fake_run_agent)
 
-    extra = {"reply_in_thread": False}
+    extra = {"reply_in_thread": False, "dm_top_level_threads_as_sessions": False}
     if cards:
         extra["native_task_cards"] = True
     adapter = SlackAdapter(PlatformConfig(enabled=True, token="xoxb-test", extra=extra))
@@ -240,83 +257,129 @@ async def _turn(monkeypatch, tmp_path, fake, agent_cls, *, cards=True, dm=False)
     gateway_run = importlib.import_module("gateway.run")
     monkeypatch.setattr(gateway_run, "_hermes_home", tmp_path)
     monkeypatch.setattr(gateway_run, "_resolve_runtime_agent_kwargs", lambda: {"api_key": "***"})
-    if not dm:
-        # A top-level channel message: inbound sets thread_id to the message's own ts.
-        source = SessionSource(platform=Platform.SLACK, chat_id=CHANNEL, chat_type="group",
-                               thread_id=MESSAGE_TS, user_id="U0000000001", scope_id="T0000000001")
-        return await runner._run_agent(
-            message="hello", context_prompt="", history=[], source=source, session_id="sess-card",
-            session_key=f"agent:main:slack:group:{CHANNEL}:{MESSAGE_TS}", event_message_id=MESSAGE_TS)
-    # A top-level DM, one session per DM: inbound leaves thread_id unset. Driven through the
-    # processing hooks and final send in the order the gateway's message handler runs them.
-    from gateway.platforms.base import _thread_metadata_for_source
-    from gateway.platforms.event import MessageEvent, ProcessingOutcome
-    from gateway.response_filters import is_intentional_silence_agent_result
-    adapter.config.extra["dm_top_level_threads_as_sessions"] = False
-    source = SessionSource(platform=Platform.SLACK, chat_id=DM, chat_type="dm",
+    chat = DM if where == "dm" else CHANNEL
+    chat_type = "dm" if where == "dm" else "group"
+    # Flat replies: a top-level message has no thread; a thread reply carries its root.
+    thread = ROOT_TS if where == "thread" else None
+    source = SessionSource(platform=Platform.SLACK, chat_id=chat, chat_type=chat_type, thread_id=thread,
                            user_id="U0000000001", scope_id="T0000000001")
+    if addressed:
+        adapter._track_reacting_message("T0000000001", MESSAGE_TS)  # the eyes go on
     event = MessageEvent(text="hello", source=source, message_id=MESSAGE_TS)
     await adapter.on_processing_start(event)
     result = await runner._run_agent(
         message="hello", context_prompt="", history=[], source=source, session_id="sess-card",
-        session_key=f"agent:main:slack:dm:{DM}", event_message_id=MESSAGE_TS)
+        session_key=f"agent:main:slack:{chat_type}:{chat}:{thread}", event_message_id=MESSAGE_TS)
     if not is_intentional_silence_agent_result(result, result.get("final_response")):
-        await adapter.send(DM, result["final_response"], reply_to=MESSAGE_TS,
+        await adapter.send(chat, result["final_response"], reply_to=MESSAGE_TS,
                            metadata=_thread_metadata_for_source(source, MESSAGE_TS))
     await adapter.on_processing_complete(event, ProcessingOutcome.SUCCESS)
     return result
 
 
+def _left(fake):
+    """What the chat shows afterwards, in order: a card's step states, or a reply's text."""
+    shown = []
+    for msg in fake.messages.values():
+        plans = [b for b in msg.get("blocks") or [] if b.get("type") == "plan"]
+        shown.append([(t["title"], t["status"]) for t in plans[0]["tasks"]] if plans else msg.get("text"))
+    return shown
+
+
 @pytest.mark.asyncio
-async def test_tool_turn_shows_a_plan_in_the_message_thread_then_answers_once(monkeypatch, tmp_path, slack):
+@pytest.mark.parametrize("where", ["channel", "dm"])
+async def test_top_level_turn_keeps_a_flat_card_above_its_one_answer(monkeypatch, tmp_path, slack, where):
+    fake = await slack()
+
+    result = await _turn(monkeypatch, tmp_path, fake, ToolAgent, where=where)
+
+    plans = fake.plan_frames()
+    assert {plan["title"] for plan in plans} == {"working on it"}
+    assert [t["title"] for t in plans[0]["tasks"]] == ["thinking"]  # up before any tool ran
+    # Shown running, then ended with its result (the flat pace may fold a short step's frames).
+    states = fake.flat_task_states()
+    assert states["call-1"] == ["in_progress", "complete"] and states["call-2"][-1] == "error"
+    assert _left(fake) == [[("checking slack", "complete"), ("running a query", "error")], result["final_response"]]
+    # Nothing opened a thread.
+    assert not any(body.get("thread_ts") for _, body in fake.calls)
+    assert "chat.startStream" not in [m for m, _ in fake.calls]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("where", ["channel", "dm"])
+@pytest.mark.parametrize("agent_cls", [NoToolAgent, SilentToolAgent], ids=["no-tools", "no-reply"])
+async def test_top_level_chat_turn_keeps_its_card_and_a_silent_one_leaves_nothing(
+        monkeypatch, tmp_path, slack, agent_cls, where):
+    fake = await slack()
+
+    result = await _turn(monkeypatch, tmp_path, fake, agent_cls, where=where)
+
+    assert fake.plan_frames()  # the card was up while the turn ran
+    expected = [] if agent_cls is SilentToolAgent else [[("thinking", "complete")], result["final_response"]]
+    assert _left(fake) == expected
+
+
+@pytest.mark.asyncio
+async def test_unaddressed_channel_turn_shows_no_card(monkeypatch, tmp_path, slack):
+    fake = await slack()
+
+    await _turn(monkeypatch, tmp_path, fake, SilentToolAgent, where="channel", addressed=False)
+
+    assert not fake.plan_frames() and fake.calls == []
+
+
+@pytest.mark.asyncio
+async def test_a_silent_turns_card_is_gone_even_when_slack_refuses_the_first_delete(monkeypatch, tmp_path, slack):
+    fake = await slack(fail_once={"chat.delete"})
+
+    await _turn(monkeypatch, tmp_path, fake, SilentToolAgent, where="channel")
+
+    assert fake.plan_frames() and fake.messages == {}
+
+
+@pytest.mark.asyncio
+async def test_card_edits_across_busy_turns_stay_under_slacks_edit_rate(slack):
+    from gateway.platforms.event import MessageEvent
+    fake = await slack()
+    adapter = SlackAdapter(PlatformConfig(enabled=True, token="xoxb-test", extra={
+        "reply_in_thread": False, "native_task_cards": True}))
+    adapter._app = SimpleNamespace(client=fake.client)
+    anchors = [f"1700000000.00030{i}" for i in range(3)]  # three turns running at once in one channel
+    for ts in anchors:
+        adapter._track_reacting_message("T0000000001", ts)
+        await adapter.on_processing_start(MessageEvent(text="hi", message_id=ts, source=SessionSource(
+            platform=Platform.SLACK, chat_id=CHANNEL, chat_type="group", user_id="U0000000001",
+            scope_id="T0000000001")))
+
+    async def edit(ts):
+        for status in ("in_progress", "complete"):
+            await adapter.send_native_task_card_progress(
+                CHANNEL, [{"id": "t", "title": "reading files", "status": status}],
+                metadata={"sme_card_anchor_ts": ts})
+
+    await asyncio.gather(*(edit(ts) for ts in anchors))
+
+    times = [at for method, at in fake.call_times if method == "chat.update"]
+    assert len(times) == 6
+    assert min(b - a for a, b in zip(times, times[1:])) >= 1.1  # at most ~50 edits a minute
+
+
+@pytest.mark.asyncio
+async def test_thread_turn_shows_a_plan_in_its_thread_then_answers_there(monkeypatch, tmp_path, slack):
     fake = await slack()
 
     result = await _turn(monkeypatch, tmp_path, fake, ToolAgent)
 
-    methods = [m for m, _ in fake.calls]
-    assert methods[0] == "chat.startStream" and methods[-1] == "chat.stopStream"
     card = fake.card()
-    assert card["thread_ts"] == MESSAGE_TS and card["streaming"] is False
+    assert card["thread_ts"] == ROOT_TS and card["streaming"] is False
     assert fake.task_states() == {"call-1": ["in_progress", "complete"],
                                   "call-2": ["in_progress", "error"]}
     titles = {c["title"] for c in card["chunks"] if c["type"] == "task_update"}
     assert titles == {"checking slack", "running a query"}
     assert {c["title"] for c in card["chunks"] if c["type"] == "plan_update"} == {"working on it"}
-    # The answer is the normal reply: the turn itself posted no message and streamed no text.
-    assert result["final_response"] == ToolAgent.final
-    assert "chat.postMessage" not in methods and not card.get("text")
-
-
-@pytest.mark.asyncio
-async def test_dm_turn_shows_a_flat_plan_then_leaves_only_the_answer(monkeypatch, tmp_path, slack):
-    fake = await slack()
-
-    result = await _turn(monkeypatch, tmp_path, fake, ToolAgent, dm=True)
-
-    plans = fake.plan_frames()
-    assert plans and {plan["title"] for plan in plans} == {"working on it"}
-    assert [t["title"] for t in plans[0]["tasks"]] == ["thinking"]  # up before any tool ran
-    states = fake.flat_task_states()
-    # Shown running, then ended with its result (the DM pace may fold a short step's frames).
-    assert states["call-1"] == ["in_progress", "complete"] and states["call-2"][-1] == "error"
-    assert {t["title"] for t in plans[-1]["tasks"]} == {"checking slack", "running a query"}
-    # No threads anywhere in the DM, and the answer is the one message left.
-    assert not any(body.get("thread_ts") for _, body in fake.calls)
-    assert "chat.startStream" not in [m for m, _ in fake.calls]
-    assert list(fake.messages.values()) == [
-        {"thread_ts": None, "text": result["final_response"], "streaming": False}]
-
-
-@pytest.mark.asyncio
-@pytest.mark.parametrize("agent_cls", [NoToolAgent, SilentToolAgent], ids=["no-tools", "no-reply"])
-async def test_dm_card_goes_away_on_chat_and_silent_turns(monkeypatch, tmp_path, slack, agent_cls):
-    fake = await slack()
-
-    result = await _turn(monkeypatch, tmp_path, fake, agent_cls, dm=True)
-
-    assert fake.plan_frames()  # the card was up while the turn ran
-    left = [m["text"] for m in fake.messages.values()]
-    assert left == ([] if agent_cls is SilentToolAgent else [result["final_response"]])
+    assert not fake.plan_frames()  # no flat card on top of it
+    answers = [m for ts, m in fake.messages.items() if ts != CARD_TS]
+    assert answers == [{"thread_ts": ROOT_TS, "text": result["final_response"], "streaming": False}]
 
 
 @pytest.mark.asyncio
@@ -327,8 +390,7 @@ async def test_thread_turns_show_the_responding_status_and_top_level_dms_do_not(
     adapter = SlackAdapter(PlatformConfig(enabled=True, token="xoxb-test", extra={
         "reply_in_thread": False, "dm_top_level_threads_as_sessions": False}))
     adapter._app = SimpleNamespace(client=fake.client)
-    root = "1700000000.000050"
-    cases = {(CHANNEL, root): "group", (DM, root): "dm", (DM, None): "dm"}
+    cases = {(CHANNEL, ROOT_TS): "group", (DM, ROOT_TS): "dm", (DM, None): "dm", (CHANNEL, None): "group"}
 
     for (chat, thread), chat_type in cases.items():
         source = SessionSource(platform=Platform.SLACK, chat_id=chat, chat_type=chat_type, thread_id=thread,
@@ -338,35 +400,34 @@ async def test_thread_turns_show_the_responding_status_and_top_level_dms_do_not(
         await adapter.send_typing(chat, metadata=metadata)
         await adapter.stop_typing(chat, metadata=metadata)
 
-    # Shown, then cleared, on the thread (channel and DM); never on a top-level DM message.
-    assert fake.status_shown == {root: ["is thinking...", "", "is thinking...", ""]}
+    # Shown, then cleared, on the thread (channel and DM); never on a top-level message.
+    assert fake.status_shown == {ROOT_TS: ["is thinking...", "", "is thinking...", ""]}
     assert fake.messages == {}
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("dm", [False, True], ids=["channel", "dm"])
-async def test_failing_tool_puts_no_args_names_or_error_text_on_the_wire(monkeypatch, tmp_path, slack, dm):
+@pytest.mark.parametrize("where", ["thread", "channel"])
+async def test_failing_tool_puts_no_args_names_or_error_text_on_the_wire(monkeypatch, tmp_path, slack, where):
     fake = await slack()
 
-    await _turn(monkeypatch, tmp_path, fake, ToolAgent, dm=dm)
+    await _turn(monkeypatch, tmp_path, fake, ToolAgent, where=where)
 
     wire = fake.wire_text()
-    states = fake.flat_task_states() if dm else fake.task_states()
+    states = fake.flat_task_states() if where == "channel" else fake.task_states()
     assert "error" in json.dumps(states)  # the failure did reach the card
-    for leaked in (SECRET_ARG, "xoxb-NOT-A-REAL-TOKEN", SECRET_ERROR, "vault",
-                   "query_snowflake", "conversations_history", CHANNEL + "\"}"):
+    for leaked in (SECRET_ARG, "«redacted:xox…»", SECRET_ERROR, "vault",
+                   "query_snowflake", "conversations_history"):
         assert leaked not in wire
 
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("agent_cls", [NoToolAgent, SilentToolAgent], ids=["no-tools", "no-reply"])
-async def test_no_tool_and_silent_turns_leave_nothing_in_the_channel(monkeypatch, tmp_path, slack, agent_cls):
+async def test_no_tool_and_silent_thread_turns_leave_no_card(monkeypatch, tmp_path, slack, agent_cls):
     fake = await slack()
 
-    await _turn(monkeypatch, tmp_path, fake, agent_cls)
+    result = await _turn(monkeypatch, tmp_path, fake, agent_cls)
 
-    assert fake.messages == {}
-    assert "chat.postMessage" not in [m for m, _ in fake.calls]
+    assert _left(fake) == ([] if agent_cls is SilentToolAgent else [result["final_response"]])
 
 
 @pytest.mark.asyncio
@@ -375,18 +436,18 @@ async def test_streaming_error_falls_back_to_the_plain_reply(monkeypatch, tmp_pa
 
     result = await _turn(monkeypatch, tmp_path, fake, ToolAgent)
 
-    assert result["final_response"] == ToolAgent.final
-    assert fake.messages == {}  # no card and no text progress bubble
-    assert "chat.postMessage" not in [m for m, _ in fake.calls]
+    assert _left(fake) == [result["final_response"]]  # no card and no text progress bubble
 
 
 @pytest.mark.asyncio
-async def test_flag_off_streams_nothing(monkeypatch, tmp_path, slack):
+@pytest.mark.parametrize("where", ["thread", "channel"])
+async def test_flag_off_shows_no_card(monkeypatch, tmp_path, slack, where):
     fake = await slack()
 
-    await _turn(monkeypatch, tmp_path, fake, ToolAgent, cards=False)
+    result = await _turn(monkeypatch, tmp_path, fake, ToolAgent, cards=False, where=where)
 
-    assert fake.calls == []
+    assert _left(fake) == [result["final_response"]]
+    assert not fake.plan_frames() and "chat.startStream" not in [m for m, _ in fake.calls]
 
 
 @pytest.mark.asyncio
