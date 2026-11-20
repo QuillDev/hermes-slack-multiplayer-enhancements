@@ -495,12 +495,34 @@ def _card_label(tool_name) -> str:
     return "using a tool"
 
 
+_THINKING_PREFIX = "sme_thinking_"
+
+
+def _thinking_task(state, status):
+    task_id = f"{_THINKING_PREFIX}{sum(i.startswith(_THINKING_PREFIX) for i in state.task_order) + 1}"
+    state.task_order.append(task_id)
+    state.tasks[task_id] = {"id": task_id, "title": "thinking", "status": status}
+
+
 def _make_apply_event(original):
     def apply_event(self, raw):
-        if isinstance(raw, dict) and raw.get("type") in {"tool.started", "tool.completed"}:
-            raw = {"type": raw["type"], "tool_call_id": raw.get("tool_call_id"),
+        kind = raw.get("type") if isinstance(raw, dict) else None
+        if kind in {"tool.started", "tool.completed"}:
+            raw = {"type": kind, "tool_call_id": raw.get("tool_call_id"),
                    "tool_name": _card_label(raw.get("tool_name")), "is_error": raw.get("is_error")}
-        return original(self, raw)
+        if kind == "tool.started":
+            # The thinking that led to this tool is over. The turn opened with thinking, so the
+            # first tool gets that step in front of it (the flat card already shows it running).
+            if not self.task_order:
+                _thinking_task(self, "complete")
+            for task in self.tasks.values():
+                if task["id"].startswith(_THINKING_PREFIX) and task["status"] == "in_progress":
+                    task["status"] = "complete"
+        changed = original(self, raw)
+        if kind == "tool.completed" and changed and \
+                not any(t["status"] == "in_progress" for t in self.tasks.values()):
+            _thinking_task(self, "in_progress")  # every tool is done: back to thinking
+        return changed
     apply_event.__wrapped__ = original
     return apply_event
 
@@ -614,6 +636,12 @@ def _make_send_native_task_card_progress(original):
             card = _flat_card(self, chat_id, metadata)
             if card is not None:
                 return await _update_flat_card(self, card, tasks)
+        # Thinking steps are for the flat card: a thread card's stream can't finish the last one,
+        # which would spin on after the answer.
+        tasks = [t for t in tasks if not str(t.get("id", "")).startswith(_THINKING_PREFIX)]
+        if not tasks:
+            from gateway.platforms.base import SendResult
+            return SendResult(success=True)
         result = await original(self, chat_id, tasks, title=_PLAN_TITLE, reply_to=reply_to,
                                 metadata=metadata, fallback_text=fallback_text)
         stamp = getattr(result, "message_id", None) if getattr(result, "success", False) else None
@@ -636,15 +664,15 @@ _FLAT_CARDS_ATTR = "_sme_flat_cards"
 _FLAT_GATE_ATTR = "_sme_flat_gate"
 _FLAT_CARD_MIN_INTERVAL = 1.5  # per card
 _FLAT_UPDATE_GAP = 1.2  # across every card in the process: chat.update is Tier 3 (~50/min)
-_FLAT_CARD_START = {"id": "sme_thinking", "title": "thinking", "status": "in_progress"}
+_FLAT_CARD_START = {"id": "sme_thinking_1", "title": "thinking", "status": "in_progress"}
 _FLAT_CARD_MAX_TASKS = 50  # Slack's plan block limit
 _FLAT_DELETE_TRIES = 3
+_FLAT_FINAL_TRIES = 3
+_SETTLED = {"complete", "error"}
 
 
 def _flat_plan(card):
-    tasks = list(card["tasks"].values())[-_FLAT_CARD_MAX_TASKS:] or [dict(_FLAT_CARD_START)]
-    if card.get("done"):
-        tasks = [dict(t, status="complete" if t["status"] == "in_progress" else t["status"]) for t in tasks]
+    tasks = list(card["tasks"].values())[-_FLAT_CARD_MAX_TASKS:]
     return [{"type": "plan", "title": _PLAN_TITLE,
              "tasks": [{"task_id": t["id"], "title": t["title"], "status": t["status"]} for t in tasks]}]
 
@@ -694,7 +722,8 @@ def _make_on_processing_start(original):
             if not _wants_flat_card(self, event):
                 return
             chat_id, team_id = str(event.source.chat_id), str(getattr(event.source, "scope_id", "") or "")
-            card = {"chat": chat_id, "team": team_id, "ts": None, "tasks": {}, "lock": asyncio.Lock()}
+            card = {"chat": chat_id, "team": team_id, "ts": None, "lock": asyncio.Lock(),
+                    "tasks": {_FLAT_CARD_START["id"]: dict(_FLAT_CARD_START)}}
             resp = await _flat_call(self, card, "chat.postMessage",
                                     {"channel": chat_id, "text": _PLAN_TITLE, "blocks": _flat_plan(card)})
             card["ts"] = str(resp["ts"])
@@ -750,19 +779,31 @@ def _make_on_processing_complete(original):
 
 
 async def _update_flat_card(adapter, card, tasks):
+    """Fold a frame into the card and write the whole card. A frame holds only core's recent steps,
+    so the card keeps every step it has seen, in the order they began."""
+    import asyncio
     from gateway.platforms.base import SendResult
     async with card["lock"]:
         if not card["ts"]:
             return SendResult(success=False, error="Progress stream already stopped")
         for task in tasks:
             card["tasks"][task["id"]] = {"id": task["id"], "title": task["title"], "status": task["status"]}
-        try:
-            await _flat_call(adapter, card, "chat.update", {
-                "channel": card["chat"], "ts": card["ts"], "text": _PLAN_TITLE, "blocks": _flat_plan(card)})
-        except Exception as exc:
-            # A dropped frame (rate limit, blip) isn't a dead card: each edit carries every step,
-            # so the next one catches up.
-            logger.debug("slack-multiplayer-enhancements: plan card edit failed: %s", exc)
+        if card.get("done"):
+            for seen in card["tasks"].values():
+                if seen["status"] not in _SETTLED:
+                    seen["status"] = "complete"
+        # A dropped edit (rate limit, blip) is caught up by the next one, which carries every step;
+        # the turn's last edit has no next one, so it retries.
+        tries = _FLAT_FINAL_TRIES if card.get("done") else 1
+        for attempt in range(tries):
+            try:
+                await _flat_call(adapter, card, "chat.update", {
+                    "channel": card["chat"], "ts": card["ts"], "text": _PLAN_TITLE, "blocks": _flat_plan(card)})
+                break
+            except Exception as exc:
+                logger.debug("slack-multiplayer-enhancements: plan card edit failed: %s", exc)
+                if attempt < tries - 1:
+                    await asyncio.sleep(2 ** attempt)
         return SendResult(success=True, message_id=card["ts"])
 
 
