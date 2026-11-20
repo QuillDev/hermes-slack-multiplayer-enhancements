@@ -666,6 +666,7 @@ _FLAT_CARD_MIN_INTERVAL = 1.5  # per card
 _FLAT_UPDATE_GAP = 1.2  # across every card in the process: chat.update is Tier 3 (~50/min)
 _FLAT_CARD_START = {"id": "sme_thinking_1", "title": "thinking", "status": "in_progress"}
 _FLAT_CARD_MAX_TASKS = 50  # Slack's plan block limit
+_FLAT_BLOCK_ID = "sme_plan"
 _FLAT_DELETE_TRIES = 3
 _FLAT_FINAL_TRIES = 3
 _SETTLED = {"complete", "error"}
@@ -673,7 +674,9 @@ _SETTLED = {"complete", "error"}
 
 def _flat_plan(card):
     tasks = list(card["tasks"].values())[-_FLAT_CARD_MAX_TASKS:]
-    return [{"type": "plan", "title": _PLAN_TITLE,
+    # One block_id for the card's whole life: a new id on each edit (Slack's docs suggest one, and
+    # Slack makes one when it's left out) re-renders the plan and snaps an opened card shut.
+    return [{"type": "plan", "block_id": _FLAT_BLOCK_ID, "title": _PLAN_TITLE,
              "tasks": [{"task_id": t["id"], "title": t["title"], "status": t["status"]} for t in tasks]}]
 
 
